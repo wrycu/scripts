@@ -1,0 +1,10 @@
+[project]
+name = "scripts"
+version = "0.1.0"
+description = "Collection of one-off scripts"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.13.5",
+    "flask>=3.1.2",
+    "slack-sdk>=3.36.0",
+]
