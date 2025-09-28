@@ -107,8 +107,8 @@ def setup_tracker(conf):
     tracker.rate_media(108545, "tv", 4)
 
 def extract_media_from_event(event_json):
-    if event_json['Event'] != "MarkPlayed":
-        print("Disregarding non-play event")
+    if event_json['Event'] == 'Stop' and not event_json['Item']['UserData']['Played']:
+        print(f"Disregarding non-finished playback event of type {event_json['Event']}")
         return
     if event_json['Item']['Type'] == "Movie":
         media_type = "movie"

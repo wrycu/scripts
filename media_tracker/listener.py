@@ -14,7 +14,6 @@ def capture_response():
     signature_verifier = SignatureVerifier(
         signing_secret=config_obj.get("media_tracker", "slack_signing_secret"),
     )
-    print(request.headers)
     if not signature_verifier.is_valid_request(
         body=request.get_data(),
         headers=dict(request.headers),
@@ -34,6 +33,7 @@ def capture_response():
 
 @app.route("/watch", methods=['POST'])
 def capture_watch():
+    print("caught jellyfin watch event")
     event_info = helpers.extract_media_from_event(request.json)
     helpers.query_user(
         event_info['id'],
