@@ -9,7 +9,7 @@
       "reason": "Forward completed-play events to the like/dislike backend service.",
       "requiredHosts": [
         "127.0.0.1",
-        "localhost"
+        "slack.wrycu.com"
       ]
     },
     "subsonicapi": {
@@ -26,8 +26,8 @@
         "backend_url": {
           "type": "string",
           "title": "Backend URL",
-          "description": "media_tracker /scrobble endpoint",
-          "default": "http://127.0.0.1:5190/scrobble"
+          "description": "media_tracker /scrobble endpoint. In Docker use the host's LAN IP, not 127.0.0.1 (that is the container).",
+          "default": "https://slack.wrycu.com/scrobble"
         },
         "shared_secret": {
           "type": "string",
@@ -41,9 +41,20 @@
       ]
     },
     "uiSchema": {
-      "shared_secret": {
-        "ui:widget": "password"
-      }
+      "type": "VerticalLayout",
+      "elements": [
+        {
+          "type": "Control",
+          "scope": "#/properties/backend_url"
+        },
+        {
+          "type": "Control",
+          "scope": "#/properties/shared_secret",
+          "options": {
+            "format": "password"
+          }
+        }
+      ]
     }
   }
 }
