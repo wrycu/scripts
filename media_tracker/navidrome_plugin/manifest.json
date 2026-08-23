@@ -1,0 +1,49 @@
+{
+  "name": "Like/Dislike Slack Prompt",
+  "author": "wrycu",
+  "version": "0.1.0",
+  "description": "On song completion, asks the user in Slack whether they liked the song and records the answer.",
+  "website": "https://github.com/wrycu/scripts",
+  "permissions": {
+    "http": {
+      "reason": "Forward completed-play events to the like/dislike backend service.",
+      "requiredHosts": [
+        "127.0.0.1",
+        "localhost"
+      ]
+    },
+    "subsonicapi": {
+      "reason": "Read the user's play queue to attach best-effort playlist context."
+    },
+    "users": {
+      "reason": "Receive scrobble events for users assigned to this plugin."
+    }
+  },
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "backend_url": {
+          "type": "string",
+          "title": "Backend URL",
+          "description": "media_tracker /scrobble endpoint",
+          "default": "http://127.0.0.1:5190/scrobble"
+        },
+        "shared_secret": {
+          "type": "string",
+          "title": "Shared Secret",
+          "description": "Must equal plugin_shared_secret in config.ini"
+        }
+      },
+      "required": [
+        "backend_url",
+        "shared_secret"
+      ]
+    },
+    "uiSchema": {
+      "shared_secret": {
+        "ui:widget": "password"
+      }
+    }
+  }
+}

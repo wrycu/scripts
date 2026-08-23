@@ -1,0 +1,20 @@
+; Copy to config.ini and fill in. config.ini is gitignored — keep it that way.
+[media_tracker]
+; YamTracker credentials
+username: your-username
+password: your-password
+URL: https://track.example.com
+; Slack app credentials (api.slack.com/apps)
+slack_client_id: 000000000000.0000000000000
+slack_client_secret: your-client-secret
+slack_signing_secret: your-signing-secret
+slack_bot_user_oauth_token: xoxb-your-bot-token
+; Your Slack member ID (Profile -> Copy member ID)
+slack_user_id: U00000000
+
+[navidrome]
+; Must match the plugin's shared_secret, set in Navidrome's plugin config UI.
+; Generate with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+plugin_shared_secret: change-me
+; Relative paths resolve against the repo root (next to this file).
+db_path: ratings.db

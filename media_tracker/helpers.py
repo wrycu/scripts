@@ -2,7 +2,34 @@ import httpx
 from bs4 import BeautifulSoup
 from configparser import ConfigParser
 from datetime import datetime
+from pathlib import Path
 from slack_sdk import WebClient
+
+# Resolved from this file rather than the cwd, so the listener can be started
+# from anywhere (systemd, a container, the repo root).
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.ini"
+
+
+def load_config():
+    """Read config.ini. Raises if it is missing, rather than silently yielding
+    an empty config and failing later on a confusing KeyError."""
+    config_obj = ConfigParser()
+    if not config_obj.read(CONFIG_PATH):
+        raise RuntimeError(f"config file not found: {CONFIG_PATH}")
+    return config_obj
+
+
+def slack_dm():
+    """Open (or reuse) the DM channel with the configured user.
+
+    Returns (WebClient, channel_id).
+    """
+    config_obj = load_config()
+    client = WebClient(config_obj.get("media_tracker", "slack_bot_user_oauth_token"))
+    response = client.conversations_open(
+        users=config_obj.get("media_tracker", "slack_user_id"),
+    )
+    return client, response.data["channel"]["id"]
 
 class YamTracker:
     def __init__(self, username, password, url):
@@ -79,8 +106,7 @@ class YamTracker:
 
 
 def rate_media(media_id, media_type, rating):
-    config_obj = ConfigParser()
-    config_obj.read("../config.ini")
+    config_obj = load_config()
     conf = {
         "user": config_obj.get("media_tracker", "username"),
         "password": config_obj.get("media_tracker", "password"),
@@ -128,20 +154,7 @@ def extract_media_from_event(event_json):
     }
 
 def query_user(media_id, media_type, media_name):
-    # load the config
-    config_obj = ConfigParser()
-    config_obj.read("../config.ini")
-    conf = {
-        "user": config_obj.get("media_tracker", "username"),
-        "password": config_obj.get("media_tracker", "password"),
-        "URL": config_obj.get("media_tracker", "URL"),
-        "slack_client_secret": config_obj.get("media_tracker", "slack_bot_user_oauth_token"),
-        "slack_user_id": config_obj.get("media_tracker", "slack_user_id"),
-    }
-
-    client = WebClient(conf['slack_client_secret'])
-    response = client.conversations_open(users=conf['slack_user_id'])
-    dm_channel = response.data["channel"]["id"]
+    client, dm_channel = slack_dm()
 
     question = f"I see you finished {media_name}. How'd you like it?"
     buttons = [
@@ -153,7 +166,7 @@ def query_user(media_id, media_type, media_name):
                 "emoji": True
             },
             "style": "danger",
-            "value": f"1.{media_id}.{media_type}"
+            "value": f"jellyfin.1.{media_id}.{media_type}"
         },
         {
             "type": "button",
@@ -162,7 +175,7 @@ def query_user(media_id, media_type, media_name):
                 "text": "2",
                 "emoji": True
             },
-            "value": f"2.{media_id}.{media_type}"
+            "value": f"jellyfin.2.{media_id}.{media_type}"
         },
         {
             "type": "button",
@@ -171,7 +184,7 @@ def query_user(media_id, media_type, media_name):
                 "text": "3",
                 "emoji": True
             },
-            "value": f"3.{media_id}.{media_type}"
+            "value": f"jellyfin.3.{media_id}.{media_type}"
         },
         {
             "type": "button",
@@ -180,7 +193,7 @@ def query_user(media_id, media_type, media_name):
                 "text": "4",
                 "emoji": True
             },
-            "value": f"4.{media_id}.{media_type}"
+            "value": f"jellyfin.4.{media_id}.{media_type}"
         },
         {
             "type": "button",
@@ -190,7 +203,7 @@ def query_user(media_id, media_type, media_name):
                 "emoji": True
             },
             "style": "primary",
-            "value": f"5.{media_id}.{media_type}",
+            "value": f"jellyfin.5.{media_id}.{media_type}",
         }
     ]
 
@@ -214,20 +227,7 @@ def query_user(media_id, media_type, media_name):
     )
 
 def ack_rating():
-    # load the config
-    config_obj = ConfigParser()
-    config_obj.read("../config.ini")
-    conf = {
-        "user": config_obj.get("media_tracker", "username"),
-        "password": config_obj.get("media_tracker", "password"),
-        "URL": config_obj.get("media_tracker", "URL"),
-        "slack_client_secret": config_obj.get("media_tracker", "slack_bot_user_oauth_token"),
-        "slack_user_id": config_obj.get("media_tracker", "slack_user_id"),
-    }
-
-    client = WebClient(conf['slack_client_secret'])
-    response = client.conversations_open(users=conf['slack_user_id'])
-    dm_channel = response.data["channel"]["id"]
+    client, dm_channel = slack_dm()
     content = "Thanks! I've saved your rating."
     client.chat_postMessage(
         channel=dm_channel,

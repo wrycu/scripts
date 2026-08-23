@@ -1,0 +1,13 @@
+# Local configuration — contains live credentials. See config.ini.example.
+config.ini
+
+# Ratings database
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE
+.idea/
