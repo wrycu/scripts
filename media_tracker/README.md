@@ -113,9 +113,12 @@ Navidrome  getSong ──▶ file path
 cd media_tracker
 ../.venv/bin/python reap.py            # dry run: prints what it would do
 ../.venv/bin/python reap.py --apply    # actually delete + unmonitor
-../.venv/bin/python reap.py --apply --limit 5   # ease into it
+../.venv/bin/python reap.py --apply --limit 5   # stop after 5 deletions
 ../.venv/bin/python reap.py --status   # just show the queue
 ```
+
+`--limit` counts **deletions**, not songs examined, so a run of skipped songs
+cannot use it up — `--apply --limit 1` always means "make exactly one change".
 
 **Dry run is the default** — nothing is deleted, and no row is marked, unless you
 pass `--apply`.

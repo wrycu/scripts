@@ -54,6 +54,10 @@ SUSPECT_MISSING = object()
 # exact fix, so it aborts immediately rather than after a run of failures.
 SYNTHESIZED_PATH = object()
 
+# Dry-run sentinel: this song WOULD have been acted on. Lets --limit ration
+# actions identically whether or not --apply is set.
+WOULD_ACT = object()
+
 # Abort after this many consecutive absences with nothing yet deleted from disk.
 SUSPECT_LIMIT = 10
 
@@ -338,7 +342,7 @@ def delete_from_disk(path, song, label, *, disk_root, apply_changes,
     if not apply_changes:
         logger.info("WOULD delete from disk %s", target)
         logger.info("      (not in lidarr, so nothing to unmonitor)")
-        return None, None
+        return WOULD_ACT, None
 
     os.unlink(target)
     logger.info("DELETED from disk %s", target)
@@ -441,7 +445,7 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
         logger.info("      and unmonitor %r by %r (album %s)",
                     (album or {}).get("title"), matched_artist.get("artistName"),
                     album_id)
-        return None, None
+        return WOULD_ACT, None
 
     lidarr.delete_track_file(track_file["id"])
     logger.info("DELETED %s (trackFile %s)", track_file.get("path"), track_file["id"])
@@ -469,7 +473,8 @@ def main(argv=None):
     parser.add_argument("--apply", action="store_true",
                         help="actually delete and unmonitor (default: dry run)")
     parser.add_argument("--limit", type=int, metavar="N",
-                        help="process at most N songs this run")
+                        help="stop after N deletions (skips do not count, so a "
+                             "run of out-of-scope songs cannot consume it)")
     parser.add_argument("--retry", choices=(*RETRYABLE, "all"), metavar="STATUS",
                         help="requeue songs already recorded as unmatched or failed, "
                              "with a fresh retry budget (unmatched|failed|all)")
@@ -515,8 +520,8 @@ def main(argv=None):
             store.clear_reap_state([r["event_id"] for r in requeued])
         rows = rows + requeued
 
-    if args.limit:
-        rows = rows[: args.limit]
+    # NB: --limit is applied in the loop below, counting deletions rather than
+    # rows, so a run of skips does not consume it.
 
     if not rows:
         logger.info("nothing to do")
@@ -556,6 +561,7 @@ def main(argv=None):
 
     counts = {}
     failures = 0
+    acted = 0
     suspect = 0
     disk_deleted = 0
     unmonitored = set()
@@ -628,11 +634,21 @@ def main(argv=None):
             suspect = 0
             if status == STATUS_DELETED_DISK:
                 disk_deleted += 1
-            if status is None:
-                continue
-            if args.apply:
-                store.mark_reaped(row["event_id"], status, path)
-            counts[status] = counts.get(status, 0) + 1
+
+            if status is WOULD_ACT:
+                counts["would-delete"] = counts.get("would-delete", 0) + 1
+                acted += 1
+            elif status is not None:
+                if args.apply:
+                    store.mark_reaped(row["event_id"], status, path)
+                counts[status] = counts.get(status, 0) + 1
+                if status in (STATUS_DELETED, STATUS_DELETED_DISK):
+                    acted += 1
+
+            if args.limit and acted >= args.limit:
+                logger.info("stopping: --limit %d reached (%d song(s) left queued)",
+                            args.limit, len(rows) - rows.index(row) - 1)
+                break
 
     summary = ", ".join(f"{count} {status}" for status, count in sorted(counts.items()))
     logger.info("done: %s%s", summary or "no terminal outcomes",
