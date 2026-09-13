@@ -41,6 +41,7 @@ STATUS_DELETED_DISK = "deleted-on-disk"  # removed directly; lidarr does not tra
 STATUS_MISSING = "missing"      # already gone from Navidrome; nothing to delete
 STATUS_UNMATCHED = "unmatched"  # Navidrome knows it, Lidarr does not
 STATUS_FAILED = "failed"        # kept erroring; gave up after MAX_ATTEMPTS
+STATUS_OUT_OF_SCOPE = "out-of-scope"  # a navidrome library this job does not manage
 
 # Not a reap_status: a sentinel meaning "the composed path is not on disk".
 # Deliberately never recorded on its own. An absent file is only proof of an
@@ -195,6 +196,23 @@ def diagnose(rows, subsonic, lidarr):
     return 0
 
 
+def in_managed_library(navidrome_path: str, navidrome_root: str) -> bool:
+    """Is this song in the navidrome library this job is responsible for?
+
+    Navidrome can serve several music folders. Checking the boundary here rather
+    than only in the disk fallback keeps a library wholly in or wholly out: the
+    alternative splits it by the accident of which tracks Lidarr happens to know,
+    deleting some and unmonitoring their albums while skipping the rest.
+
+    With no navidrome_root configured there is only one library as far as we know,
+    so everything is in scope.
+    """
+    if not navidrome_root or not navidrome_path.startswith("/"):
+        return True
+    prefix = "/" + navidrome_root.strip("/")
+    return navidrome_path == prefix or navidrome_path.startswith(prefix + "/")
+
+
 def looks_synthesized(song, basename: str) -> bool:
     """True if Navidrome built this filename from tags instead of reading it.
 
@@ -235,10 +253,10 @@ def resolve_disk_path(disk_root: str, navidrome_path: str,
         if navidrome_path == prefix or navidrome_path.startswith(prefix + "/"):
             navidrome_path = navidrome_path[len(prefix):]
         elif navidrome_path.startswith("/"):
-            # A different navidrome library (a second music folder with its own
-            # root). Not an error: it simply is not the tree this job manages.
-            logger.info("SKIP  %s: outside the managed library %r",
-                        navidrome_path, navidrome_root)
+            # Normally caught earlier by in_managed_library(); kept as a backstop
+            # so this function is safe to call on its own.
+            logger.debug("%s is outside the managed library %r",
+                         navidrome_path, navidrome_root)
             return None
 
     components = [c for c in navidrome_path.split("/") if c]
@@ -386,6 +404,12 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
     if not path:
         logger.warning("SKIP  %s: navidrome returned no path", label)
         return STATUS_UNMATCHED, None
+
+    if not in_managed_library(path, navidrome_root):
+        # Checked before the lidarr lookup, so an out-of-scope library is skipped
+        # whole rather than partly deleted via whichever route happens to reach it.
+        logger.info("SKIP  %s: in another navidrome library (%s)", label, path)
+        return STATUS_OUT_OF_SCOPE, None
 
     match = lidarr.find_track_file(
         path=path,

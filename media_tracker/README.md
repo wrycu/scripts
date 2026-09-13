@@ -179,6 +179,20 @@ Comparisons are case-folded and Unicode-normalised (NFC), so a macOS-decomposed
 accent still matches. That can only make two spellings of the *same* name compare
 equal, never two different names.
 
+### One library at a time
+
+Navidrome can serve several music folders. `navidrome_root` says which one this
+job manages, and the boundary is checked *before* Lidarr is consulted — not only
+in the disk fallback.
+
+That ordering matters. Lidarr may well hold tracks from another library under a
+path of its own, so checking late splits that library by the accident of which
+tracks Lidarr happens to know: some get deleted and their albums unmonitored,
+the rest are skipped. Checking first keeps a library wholly in or wholly out.
+
+Leave `navidrome_root` blank if you only have one library; everything is then in
+scope.
+
 ### Not deleting outside the library
 
 Direct deletion is fenced by the music root. Navidrome's path is library data, so
@@ -233,6 +247,7 @@ work does not pile up run after run:
 |-------------|-----------------------------------------------------------------|
 | `deleted`   | removed via Lidarr, album unmonitored                            |
 | `deleted-on-disk` | removed directly; Lidarr does not track it, so nothing to unmonitor |
+| `out-of-scope` | in a different Navidrome library; not this job's to manage      |
 | `missing`   | already gone from Navidrome — nothing left to delete             |
 | `unmatched` | could not be identified with confidence — left alone, see above  |
 | `failed`    | errored `MAX_ATTEMPTS` times; gave up rather than retry for ever |
