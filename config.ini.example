@@ -31,9 +31,17 @@ enabled: true
 ; Subsonic API credentials, used to resolve a track_id to its file path.
 ; Any Navidrome user works; a read-only account is fine.
 url: https://music.example.com
-; Navidrome's library root as seen FROM THE HOST RUNNING reap.py. Navidrome
-; reports paths relative to this. Songs Lidarr does not track are deleted
-; directly from here; leave blank to skip those instead.
+; The same library as two different hosts see it. navidrome_root is the path
+; Navidrome reports (shown in its UI under Get Info -> File path, e.g.
+; /music/...); music_root is where that tree is mounted ON THE HOST RUNNING
+; reap.py. Songs Lidarr does not track are deleted from music_root; leave
+; music_root blank to skip those instead.
+;
+; Navidrome must also be told to report REAL paths over the Subsonic API --
+; set ND_SUBSONIC_DEFAULTREPORTREALPATH=true, or enable 'Report Real Path'
+; for the media-tracker-reaper player. Without it Navidrome synthesizes
+; filenames from tags and nothing will be found on disk.
+navidrome_root: /music
 music_root: /path/to/music
 username: your-navidrome-user
 password: your-navidrome-password

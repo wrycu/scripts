@@ -134,7 +134,7 @@ class Lidarr:
 
         # The path told us which file; confirm the artist independently, so a
         # coincidental path collision cannot carry us onto the wrong artist.
-        expected = {_norm(name) for name in (artist, album_artist) if name}
+        expected = _artist_names(artist, album_artist)
         actual = _norm(matched_artist.get("artistName"))
         if expected and actual not in expected:
             logger.warning(
@@ -158,7 +158,7 @@ class Lidarr:
         precisely when we are least sure who the artist is, which is exactly
         when a coincidental path collision would do damage.
         """
-        names = {_norm(name) for name in (artist, album_artist) if name}
+        names = _artist_names(artist, album_artist)
         by_name = [a for a in self.artists() if _norm(a.get("artistName")) in names]
         if by_name:
             return by_name
@@ -201,6 +201,30 @@ class Lidarr:
 
 def _components(path: str) -> list[str]:
     return [part for part in path.replace("\\", "/").split("/") if part]
+
+
+# Navidrome joins multiple credited artists into one field. Splitting on these
+# lets "Foxes;Jonny Harris" match the lidarr artist "Foxes". Deliberately not
+# splitting on "&" or ",", which appear inside real artist names.
+_ARTIST_SEPARATORS = (";", "\u2022", "/")
+
+
+def _artist_names(*values) -> set[str]:
+    """Every individual artist name mentioned, normalised.
+
+    Includes the unsplit original, so an artist whose real name contains a
+    separator still matches.
+    """
+    names = set()
+    for value in values:
+        if not value:
+            continue
+        names.add(_norm(value))
+        parts = [value]
+        for separator in _ARTIST_SEPARATORS:
+            parts = [bit for part in parts for bit in part.split(separator)]
+        names.update(_norm(part) for part in parts if part.strip())
+    return names
 
 
 def _norm(value: str | None) -> str:

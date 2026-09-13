@@ -42,6 +42,20 @@ STATUS_MISSING = "missing"      # already gone from Navidrome; nothing to delete
 STATUS_UNMATCHED = "unmatched"  # Navidrome knows it, Lidarr does not
 STATUS_FAILED = "failed"        # kept erroring; gave up after MAX_ATTEMPTS
 
+# Not a reap_status: a sentinel meaning "the composed path is not on disk".
+# Deliberately never recorded on its own. An absent file is only proof of an
+# earlier deletion once we have seen the path scheme work at least once this
+# run; until then it is just as likely that music_root is wrong, the library is
+# not mounted, or navidrome is reporting synthesized paths rather than real ones.
+SUSPECT_MISSING = object()
+
+# Navidrome is reporting tag-derived filenames. A configuration problem with an
+# exact fix, so it aborts immediately rather than after a run of failures.
+SYNTHESIZED_PATH = object()
+
+# Abort after this many consecutive absences with nothing yet deleted from disk.
+SUSPECT_LIMIT = 10
+
 RETRYABLE = (STATUS_UNMATCHED, STATUS_FAILED)
 
 # How many times a song may fail transiently before we stop queueing it. Without
@@ -52,6 +66,19 @@ MAX_ATTEMPTS = 5
 
 def _norm(value):
     return unicodedata.normalize("NFC", (value or "").strip()).casefold()
+
+
+def _loose(value):
+    """Fold away punctuation for comparing titles between two catalogues.
+
+    Lidarr takes titles from MusicBrainz while Navidrome takes them from tags,
+    so the same album is routinely "Greatest Hits I, II & III: The Platinum
+    Collection" in one and "Greatest Hits I II & III-The Platinum Collection" in
+    the other. Punctuation is replaced with spaces rather than removed, so
+    "III-The" does not become "iiithe".
+    """
+    folded = "".join(c if c.isalnum() else " " for c in _norm(value))
+    return " ".join(folded.split())
 
 
 def song_matches_row(song, row) -> bool:
@@ -168,23 +195,63 @@ def diagnose(rows, subsonic, lidarr):
     return 0
 
 
-def resolve_disk_path(disk_root: str, navidrome_path: str) -> Path | None:
+def looks_synthesized(song, basename: str) -> bool:
+    """True if Navidrome built this filename from tags instead of reading it.
+
+    With Subsonic.DefaultReportRealPath off (the default), Navidrome reports
+    "<disc:02>-<track:02> - <Title>.<ext>" rather than the real filename. That is
+    worth detecting precisely: it is a one-setting fix, and the alternative is
+    inferring it from a pile of files that appear to be missing.
+    """
+    title, suffix = song.get("title"), song.get("suffix")
+    if not title or not suffix:
+        return False
+    disc = song.get("discNumber") or 1
+    track = song.get("track") or 0
+    try:
+        expected = f"{int(disc):02d}-{int(track):02d} - {title}.{suffix}"
+    except (TypeError, ValueError):
+        return False
+    return _norm(basename) == _norm(expected)
+
+
+def resolve_disk_path(disk_root: str, navidrome_path: str,
+                      navidrome_root: str = "") -> Path | None:
     """Turn Navidrome's path into an absolute file to delete, or None to refuse.
 
-    Navidrome reports paths relative to its music folder, so they are joined onto
-    the configured root. The result must stay inside that root: the path is
-    library data, and a stray `..` must never let a deletion escape into the rest
-    of the filesystem.
+    Navidrome usually sees the library under a different prefix than this host
+    does -- `/music` inside its container versus `/plex/music` here -- so
+    `navidrome_root` is stripped before the remainder is joined onto
+    `disk_root`. A path that is already relative is joined as-is.
+
+    The result must stay inside `disk_root`: the path is library data, and a
+    stray `..` must never let a deletion escape into the rest of the filesystem.
     """
     root = Path(disk_root).resolve()
-    components = [c for c in navidrome_path.replace("\\", "/").split("/") if c]
+    navidrome_path = navidrome_path.replace("\\", "/")
+
+    if navidrome_root:
+        prefix = "/" + navidrome_root.strip("/")
+        if navidrome_path == prefix or navidrome_path.startswith(prefix + "/"):
+            navidrome_path = navidrome_path[len(prefix):]
+        elif navidrome_path.startswith("/"):
+            # A different navidrome library (a second music folder with its own
+            # root). Not an error: it simply is not the tree this job manages.
+            logger.info("SKIP  %s: outside the managed library %r",
+                        navidrome_path, navidrome_root)
+            return None
+
+    components = [c for c in navidrome_path.split("/") if c]
     if any(component == ".." for component in components):
         logger.warning("REFUSING path with a parent reference: %s", navidrome_path)
         return None
 
+    # After stripping the navidrome prefix the remainder is always relative to
+    # disk_root; an absolute leftover means no prefix was configured for it.
     candidate = Path(navidrome_path)
     target = Path(os.path.normpath(
-        candidate if candidate.is_absolute() else root.joinpath(*components)))
+        candidate if candidate.is_absolute() and not navidrome_root
+        else root.joinpath(*components)))
     if root != target and root not in target.parents:
         logger.warning("REFUSING %s: outside the configured music root %s",
                        target, root)
@@ -207,24 +274,45 @@ def resolve_disk_path(disk_root: str, navidrome_path: str) -> Path | None:
     return parent / target.name
 
 
-def delete_from_disk(path, song, label, *, disk_root, apply_changes):
+def delete_from_disk(path, song, label, *, disk_root, apply_changes,
+                     navidrome_root=""):
     """Delete a file Lidarr does not track. Returns (status, path).
 
     Nothing needs unmonitoring here: Lidarr has no record of this file, so it
     will not re-download it either.
     """
     if not disk_root:
-        logger.warning("SKIP  %s: not in lidarr, and no music_root is configured",
-                       label)
-        return STATUS_UNMATCHED, None
+        # Deliberately NOT terminal. This is a fact about the configuration, not
+        # about the song: marking it would silently drop every such song from the
+        # queue, and they would need --retry unmatched to come back. Leaving the
+        # status unset keeps them queued for when music_root is set.
+        # Reported once at startup rather than once per song.
+        logger.debug("SKIP  %s: not in lidarr and no music_root configured", label)
+        return None, None
 
-    target = resolve_disk_path(disk_root, path)
+    target = resolve_disk_path(disk_root, path, navidrome_root)
     if target is None:
         return STATUS_UNMATCHED, None
 
     if not target.exists() and not target.is_symlink():
-        logger.info("SKIP  %s: already gone from disk (%s)", label, target)
-        return STATUS_MISSING, None
+        # A missing file only means "already deleted" if the library around it is
+        # actually there. If the album directory is missing too, the tree is not
+        # mounted or music_root is wrong, and concluding the song was deleted
+        # would terminally write off songs whose files are fine.
+        if looks_synthesized(song, target.name):
+            logger.error(
+                "%s: navidrome reported %r, which is a filename built from tags, "
+                "not the real one. Set ND_SUBSONIC_DEFAULTREPORTREALPATH=true (or "
+                "enable 'Report Real Path' for the %s player in navidrome's "
+                "Players settings) and run again.",
+                label, target.name, subsonic_api.CLIENT_NAME)
+            return SYNTHESIZED_PATH, None
+        if not target.parent.is_dir():
+            logger.warning("SKIP  %s: %s does not exist — is music_root right and "
+                           "the library mounted?", label, target.parent)
+        else:
+            logger.info("SKIP  %s: not on disk at %s", label, target)
+        return SUSPECT_MISSING, None
     if target.is_dir():
         logger.warning("REFUSING %s: %s is a directory", label, target)
         return STATUS_UNMATCHED, None
@@ -259,16 +347,22 @@ def _verified_album(lidarr, album_id, matched_artist, song):
         )
         return None
     navidrome_album = song.get("album")
-    if navidrome_album and _norm(album.get("title")) != _norm(navidrome_album):
+    if navidrome_album and _loose(album.get("title")) != _loose(navidrome_album):
+        # Not fatal. The identity of the album is established by the track file
+        # itself -- lidarr gave us this albumId for this file, and the artist is
+        # confirmed above -- so a title spelled differently in two catalogues is
+        # a naming difference, not evidence of the wrong album. Worth seeing in
+        # the log, not worth skipping a deletion over.
         logger.warning(
-            "REFUSING to unmonitor album %s: lidarr calls it %r, navidrome %r",
+            "album %s is titled %r in lidarr but %r in navidrome; proceeding "
+            "because the track file and artist both check out",
             album_id, album.get("title"), navidrome_album,
         )
-        return None
     return album
 
 
-def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None):
+def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None,
+            navidrome_root=""):
     """Handle one disliked song.
 
     Returns (status, path): a terminal status and the file removed, or
@@ -305,7 +399,8 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
         # row, so it identifies the file directly rather than by fuzzy matching.
         logger.debug("%s: not in lidarr; falling back to disk", label)
         return delete_from_disk(path, song, label, disk_root=disk_root,
-                                apply_changes=apply_changes)
+                                apply_changes=apply_changes,
+                                navidrome_root=navidrome_root)
     track_file, matched_artist = match
 
     # Confirm the album before touching anything: unmonitoring is the one action
@@ -358,6 +453,9 @@ def main(argv=None):
                         help="print the reap queue and exit, changing nothing")
     parser.add_argument("--diagnose", action="store_true",
                         help="explain why queued songs cannot be matched, and exit")
+    parser.add_argument("--accept-missing", action="store_true",
+                        help="record files absent from disk as already-deleted, "
+                             "instead of stopping to ask whether the paths are right")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -416,17 +514,26 @@ def main(argv=None):
     logger.info("%d disliked song(s) to process%s",
                 len(rows), "" if args.apply else " (dry run — nothing will be deleted)")
 
+    navidrome_root = config.get("navidrome_api", "navidrome_root",
+                                fallback="").strip()
     disk_root = config.get("navidrome_api", "music_root", fallback="").strip()
     if disk_root and not Path(disk_root).is_dir():
-        logger.error("music_root %s does not exist on this host; "
-                     "songs lidarr does not track will be skipped", disk_root)
-        disk_root = ""
-    elif not disk_root:
-        logger.warning("no music_root configured; songs lidarr does not track "
-                       "cannot be deleted")
+        # Fail fast rather than degrade: a typo'd root would otherwise look
+        # exactly like "not configured" and quietly skip most of the queue.
+        logger.error("music_root %r is not a directory on this host. Set it to "
+                     "navidrome's library root as seen from here, or leave it "
+                     "blank to skip songs lidarr does not track.", disk_root)
+        return 2
+    if not disk_root:
+        logger.warning(
+            "no music_root configured in [navidrome_api]: songs lidarr does not "
+            "track will be left queued, not deleted. Set music_root to "
+            "navidrome's library root to handle them.")
 
     counts = {}
     failures = 0
+    suspect = 0
+    disk_deleted = 0
     unmonitored = set()
     with subsonic_api.Subsonic(
         config.get("navidrome_api", "url"),
@@ -446,7 +553,8 @@ def main(argv=None):
                 status, path = process(row, subsonic, lidarr,
                                        apply_changes=args.apply,
                                        unmonitored=unmonitored,
-                                       disk_root=disk_root)
+                                       disk_root=disk_root,
+                                       navidrome_root=navidrome_root)
             except Exception:
                 failures += 1
                 if not args.apply:
@@ -469,6 +577,33 @@ def main(argv=None):
                         row["title"], attempts, MAX_ATTEMPTS,
                     )
                 continue
+            if status is SYNTHESIZED_PATH:
+                logger.error("aborting: nothing recorded, the queue is intact.")
+                return 2
+            if status is SUSPECT_MISSING:
+                suspect += 1
+                if suspect >= SUSPECT_LIMIT and not disk_deleted \
+                        and not args.accept_missing:
+                    logger.error(
+                        "aborting: %d songs in a row are not at the paths navidrome "
+                        "reports, and nothing has been deleted from disk this run. "
+                        "Check that music_root (%r) is correct and mounted here, and "
+                        "that navidrome reports REAL paths — Subsonic.DefaultReportRealPath "
+                        "(ND_SUBSONIC_DEFAULTREPORTREALPATH) is false by default, which "
+                        "makes it synthesize paths from tags instead. Nothing was "
+                        "recorded; the queue is intact. Pass --accept-missing if "
+                        "they really were deleted already.", suspect, disk_root)
+                    return 2
+                # Once the scheme has been shown to work, an absent file really is
+                # a file someone deleted earlier.
+                if disk_deleted or args.accept_missing:
+                    if args.apply:
+                        store.mark_reaped(row["event_id"], STATUS_MISSING)
+                    counts[STATUS_MISSING] = counts.get(STATUS_MISSING, 0) + 1
+                continue
+            suspect = 0
+            if status == STATUS_DELETED_DISK:
+                disk_deleted += 1
             if status is None:
                 continue
             if args.apply:
