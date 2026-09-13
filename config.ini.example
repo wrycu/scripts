@@ -31,5 +31,9 @@ enabled: true
 ; Subsonic API credentials, used to resolve a track_id to its file path.
 ; Any Navidrome user works; a read-only account is fine.
 url: https://music.example.com
+; Navidrome's library root as seen FROM THE HOST RUNNING reap.py. Navidrome
+; reports paths relative to this. Songs Lidarr does not track are deleted
+; directly from here; leave blank to skip those instead.
+music_root: /path/to/music
 username: your-navidrome-user
 password: your-navidrome-password

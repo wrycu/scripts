@@ -120,13 +120,32 @@ cd media_tracker
 **Dry run is the default** — nothing is deleted, and no row is marked, unless you
 pass `--apply`.
 
-### Why it goes through Lidarr
+### Two deletion routes
 
-Deletion is `DELETE /api/v1/trackfile/{id}` rather than `os.remove`. Lidarr
-removes the file itself, which keeps its database consistent (no phantom "file
-present" records until the next rescan), honours its recycle bin if you have one
-configured, and means this job can run somewhere that has no access to the music
-share at all.
+Lidarr typically manages only the slice of a library it downloaded itself; the
+rest arrived by hand, from Plex, or predates it. So there are two routes, tried
+in order:
+
+1. **Via Lidarr**, when it tracks the file: `DELETE /api/v1/trackfile/{id}`.
+   Lidarr removes the file itself, keeping its database consistent (no phantom
+   "file present" records until the next rescan) and honouring its recycle bin.
+   The album is then unmonitored so it is not fetched again. Status `deleted`.
+2. **Straight from disk**, when Lidarr has never heard of the file: the path
+   Navidrome reported, joined onto `music_root`, is unlinked. Nothing is
+   unmonitored because Lidarr has no record to re-download from. Status
+   `deleted-on-disk`.
+
+Route 2 needs `music_root` set to Navidrome's library root *as seen from the host
+running reap.py*. Leave it blank and those songs are skipped rather than deleted.
+
+Counter-intuitively, route 2 is the more reliable identification: the path comes
+straight from Navidrome's own record for a song already verified against the
+rated row, rather than being matched across two systems. What it gives up is the
+Lidarr cross-check on the artist, so it is fenced in instead — see below.
+
+Use `reap.py --diagnose` to see which route your queue actually needs. It buckets
+every queued song by cause (`artist-not-in-lidarr`, `album-not-in-lidarr`,
+`file-path-mismatch`, `not-in-navidrome`) and changes nothing.
 
 The join between Navidrome and Lidarr is the **file path**: `track_id` is
 Navidrome's own ID and means nothing to Lidarr. Navidrome's path may be relative
@@ -160,6 +179,26 @@ Comparisons are case-folded and Unicode-normalised (NFC), so a macOS-decomposed
 accent still matches. That can only make two spellings of the *same* name compare
 equal, never two different names.
 
+### Not deleting outside the library
+
+Direct deletion is fenced by the music root. Navidrome's path is library data, so
+it is treated as untrusted input:
+
+- any path containing `..` is refused outright;
+- the target must sit inside `music_root`, so an absolute path pointing elsewhere
+  is refused;
+- the containing directory is **resolved** and must also be inside the root, so a
+  symlinked album directory cannot walk the deletion out of the library — a
+  textual check alone passes `<root>/Artist/Album/x` straight through when
+  `Album` is a link to somewhere else;
+- the filename itself is deliberately *not* resolved: a symlinked track has the
+  link removed from the library, never the file it points at;
+- directories are never unlinked, only regular files;
+- a file that is already gone reports `missing` rather than erroring.
+
+Empty album directories are left behind after the last track goes; nothing here
+removes directories. Navidrome picks the deletion up on its next scan.
+
 ### Not unmonitoring the wrong artist
 
 Unmonitoring is the one action here that affects music you never rated, so it
@@ -192,7 +231,8 @@ work does not pile up run after run:
 
 | status      | meaning                                                         |
 |-------------|-----------------------------------------------------------------|
-| `deleted`   | file removed via Lidarr, album unmonitored                       |
+| `deleted`   | removed via Lidarr, album unmonitored                            |
+| `deleted-on-disk` | removed directly; Lidarr does not track it, so nothing to unmonitor |
 | `missing`   | already gone from Navidrome — nothing left to delete             |
 | `unmatched` | could not be identified with confidence — left alone, see above  |
 | `failed`    | errored `MAX_ATTEMPTS` times; gave up rather than retry for ever |

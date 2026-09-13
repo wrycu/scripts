@@ -38,6 +38,7 @@ class Lidarr:
         )
         self._artists = None          # cached artist list
         self._track_files = {}        # artist id -> track file list
+        self._albums = {}             # artist id -> album list
 
     def close(self) -> None:
         self._client.close()
@@ -171,6 +172,16 @@ class Lidarr:
             logger.debug("narrowed by library folder rather than name: %s",
                          [a.get("artistName") for a in by_folder])
         return by_folder
+
+    def albums(self, artist_id: int) -> list[dict]:
+        """Albums Lidarr holds for one artist. Used by --diagnose to tell
+        "Lidarr has never heard of this album" apart from "it has the album but
+        not this file", which need different fixes."""
+        if artist_id not in self._albums:
+            self._albums[artist_id] = self._request(
+                "GET", "album", params={"artistId": artist_id}
+            ) or []
+        return self._albums[artist_id]
 
     def delete_track_file(self, track_file_id: int) -> None:
         """Delete the file from disk. Honours Lidarr's recycle bin if configured."""
