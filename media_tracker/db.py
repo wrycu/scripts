@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS ratings (
     slack_channel    TEXT,
     slack_ts         TEXT,
     created_at       TEXT NOT NULL,
-    responded_at     TEXT
+    responded_at     TEXT,
+    reaped_at        TEXT,                             -- when the reaper acted
+    reap_status      TEXT,                             -- deleted | missing | unmatched | failed
+    reaped_path      TEXT,                             -- the file we actually removed
+    reap_attempts    INTEGER NOT NULL DEFAULT 0        -- bounds retries of transient errors
 );
 CREATE INDEX IF NOT EXISTS idx_ratings_track
     ON ratings (navidrome_user, track_id);
@@ -45,6 +49,22 @@ class Database:
         self.path = path
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn) -> None:
+        """Add columns introduced after the first databases were created.
+
+        SQLite has no ADD COLUMN IF NOT EXISTS, so check what is already there.
+        """
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(ratings)")}
+        for column in ("reaped_at", "reap_status", "reaped_path"):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE ratings ADD COLUMN {column} TEXT")
+        if "reap_attempts" not in existing:
+            conn.execute(
+                "ALTER TABLE ratings ADD COLUMN reap_attempts INTEGER NOT NULL DEFAULT 0"
+            )
 
     @contextmanager
     def _connect(self):
@@ -147,3 +167,89 @@ class Database:
                     (navidrome_user, title, artist),
                 ).fetchone()
             return row is not None
+
+    def unreaped_dislikes(self, max_attempts: int) -> list[sqlite3.Row]:
+        """The reaper's work queue: disliked songs not yet dealt with, oldest first.
+
+        Two things keep this queue from growing without bound. A row that reaches
+        a terminal outcome gets `reaped_at` set and never returns. A row that
+        keeps hitting transient errors is retried only `max_attempts` times, after
+        which it is excluded here and marked `failed` by the caller — otherwise a
+        song that fails for a durable reason that merely looks transient would be
+        retried on every run forever.
+        """
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM ratings
+                WHERE rating = 'dislike' AND reaped_at IS NULL AND reap_attempts < ?
+                ORDER BY responded_at
+                """,
+                (max_attempts,),
+            ).fetchall()
+
+    def mark_reaped(self, event_id: str, status: str, path: str | None = None) -> None:
+        """Record a terminal outcome. `path` is the file that was actually removed,
+        kept as an audit trail of what the job has deleted."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ratings
+                SET reaped_at = ?, reap_status = ?, reaped_path = COALESCE(?, reaped_path)
+                WHERE event_id = ?
+                """,
+                (_now(), status, path, event_id),
+            )
+
+    def record_attempt(self, event_id: str) -> int:
+        """Count a failed attempt and return the new total, so the caller can tell
+        when a row has exhausted its retries."""
+        with _lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE ratings SET reap_attempts = reap_attempts + 1 WHERE event_id = ?",
+                (event_id,),
+            )
+            row = conn.execute(
+                "SELECT reap_attempts FROM ratings WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            return row["reap_attempts"] if row else 0
+
+    def reaped_with_status(self, status: str) -> list[sqlite3.Row]:
+        """Rows already recorded with a given reap_status, for --retry.
+
+        Re-processing overwrites the old mark, so a song that has since been
+        imported into Lidarr gets a second chance without being retried on every
+        single run in the meantime.
+        """
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM ratings WHERE rating = 'dislike' AND reap_status = ?"
+                " ORDER BY responded_at",
+                (status,),
+            ).fetchall()
+
+    def clear_reap_state(self, event_ids: list[str]) -> None:
+        """Put rows back in the queue with a fresh retry budget, for --retry."""
+        if not event_ids:
+            return
+        placeholders = ",".join("?" * len(event_ids))
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE ratings
+                SET reaped_at = NULL, reap_status = NULL, reap_attempts = 0
+                WHERE event_id IN ({placeholders})
+                """,
+                event_ids,
+            )
+
+    def reap_summary(self) -> list[sqlite3.Row]:
+        """Counts per reap_status, for --status."""
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT COALESCE(reap_status, 'queued') AS status, COUNT(*) AS n
+                FROM ratings WHERE rating = 'dislike'
+                GROUP BY 1 ORDER BY 1
+                """
+            ).fetchall()

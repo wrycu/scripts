@@ -9,6 +9,8 @@ Two sources feed it:
 | Jellyfin      | `POST /watch`    | 1–5 stars   | YamTracker (`media_save`) |
 | Navidrome     | `POST /scrobble` | 👍 / 👎     | `ratings.db` (SQLite)     |
 
+Disliked songs are then cleaned up off-line by [`reap.py`](#reaping-disliked-songs).
+
 Both prompts come back through the same **`POST /slack`** endpoint, which verifies
 the Slack signature and routes on the button's `value`.
 
@@ -90,6 +92,204 @@ print(c.get('navidrome','plugin_shared_secret'))")" \
 You should get a Slack DM. Inspect results with
 `sqlite3 ../ratings.db 'select title, rating, status from ratings;'`.
 
+## Reaping disliked songs
+
+`reap.py` deletes the songs you gave a 👎 and stops Lidarr from fetching them
+again. It is a scheduled batch job, not part of the request path — clicking
+Dislike only records the answer.
+
+```
+ratings.db (rating='dislike')
+      │  track_id
+      ▼
+Navidrome  getSong ──▶ file path
+      │                   │ match on trailing path components
+      ▼                   ▼
+                Lidarr trackFile ──▶ DELETE (removes the file)
+                       └─ albumId ──▶ PUT album/monitor {monitored:false}
+```
+
+```bash
+cd media_tracker
+../.venv/bin/python reap.py            # dry run: prints what it would do
+../.venv/bin/python reap.py --apply    # actually delete + unmonitor
+../.venv/bin/python reap.py --apply --limit 5   # ease into it
+../.venv/bin/python reap.py --status   # just show the queue
+```
+
+**Dry run is the default** — nothing is deleted, and no row is marked, unless you
+pass `--apply`.
+
+### Why it goes through Lidarr
+
+Deletion is `DELETE /api/v1/trackfile/{id}` rather than `os.remove`. Lidarr
+removes the file itself, which keeps its database consistent (no phantom "file
+present" records until the next rescan), honours its recycle bin if you have one
+configured, and means this job can run somewhere that has no access to the music
+share at all.
+
+The join between Navidrome and Lidarr is the **file path**: `track_id` is
+Navidrome's own ID and means nothing to Lidarr. Navidrome's path may be relative
+to its music folder while Lidarr's is absolute, so they are compared by trailing
+path components.
+
+### Not deleting the wrong file
+
+Failing to match is harmless — the song is reported and left alone. A confident
+wrong match destroys a file. So every check below refuses rather than guesses,
+and all of them must pass before anything is deleted:
+
+- **Three path components minimum** — the filename, its album directory, *and*
+  the artist directory above it. Filename plus album is not enough:
+  `Greatest Hits/01 Intro.flac` is a plausible path under any number of artists.
+- **The best match must be unique.** If two files score equally, the path does
+  not identify one track, and the tie is never broken arbitrarily.
+- **The artist is confirmed independently of the path**, so a coincidental path
+  collision cannot carry the deletion onto another artist.
+- **No blind library scan.** If no Lidarr artist matches by name or by library
+  folder, the song is left alone. Scanning everything would widen the search
+  precisely when we are least sure who the artist is.
+- **Navidrome must return the song we rated.** A `track_id` is only a pointer,
+  and a rescanned library can reissue one to a different file, so the title,
+  artist and album that come back are checked against what was stored.
+- **The title/artist fallback requires the album too, and must be unique.** The
+  same song routinely appears on a studio album, a compilation and a live
+  record; title and artist alone cannot tell those recordings apart.
+
+Comparisons are case-folded and Unicode-normalised (NFC), so a macOS-decomposed
+accent still matches. That can only make two spellings of the *same* name compare
+equal, never two different names.
+
+### Not unmonitoring the wrong artist
+
+Unmonitoring is the one action here that affects music you never rated, so it
+gets its own check rather than riding on the file match. Before it happens, the
+album is fetched from Lidarr and must prove to be the right one: its `artistId`
+has to be the artist the track file belongs to, and its title has to agree with
+what Navidrome calls the album. If either fails, nothing is deleted *or*
+unmonitored — the whole song is skipped.
+
+The dry run names the album and artist it would unmonitor, so you can audit it
+before turning `--apply` on:
+
+```
+WOULD delete /music/Boards of Canada/Geogaddi/03 Bad Song.flac
+      and unmonitor 'Geogaddi' by 'Boards of Canada' (album 55)
+```
+
+### Unmonitoring is album-wide
+
+Lidarr has no per-track monitoring — `monitored` exists on artists and albums
+only. Disliking one track therefore unmonitors **the entire album**, so nothing
+else on it will be fetched or upgraded either. This is deliberate (it is the only
+thing that actually prevents a re-download), but it is the one genuinely lossy
+part of the job.
+
+### Outcomes, and why the queue stays small
+
+Every row reaches a terminal `reap_status` and then leaves the queue for good, so
+work does not pile up run after run:
+
+| status      | meaning                                                         |
+|-------------|-----------------------------------------------------------------|
+| `deleted`   | file removed via Lidarr, album unmonitored                       |
+| `missing`   | already gone from Navidrome — nothing left to delete             |
+| `unmatched` | could not be identified with confidence — left alone, see above  |
+| `failed`    | errored `MAX_ATTEMPTS` times; gave up rather than retry for ever |
+
+`deleted` rows also record **`reaped_path`** — the file that was actually removed
+— so there is an audit trail of what the job has deleted:
+
+```bash
+sqlite3 ../ratings.db \
+  "select responded_at, reap_status, reaped_path from ratings
+   where reap_status is not null order by reaped_at desc limit 20;"
+```
+
+A transient failure (network, HTTP 5xx) is not given a terminal status, so the
+next run retries it — but it does increment `reap_attempts`, and after
+`MAX_ATTEMPTS` (5) the song is marked `failed` and dropped from the queue.
+Without that cap, anything failing for a durable reason that merely *looks*
+transient would be retried on every run forever, and those accumulate. Any run
+with failures exits non-zero, so the timer surfaces it in `systemctl status`.
+
+`missing` and `unmatched` are distinct on purpose: the first means there is
+nothing left to delete, the second means there might be and the job would not
+risk guessing. An `unmatched` song is always logged with the reason.
+
+`unmatched` and `failed` are both recoverable by hand once you have fixed the
+underlying cause — importing the album into Lidarr properly, say:
+
+```bash
+../.venv/bin/python reap.py --apply --retry unmatched   # or: failed, all
+```
+
+That requeues them with a fresh retry budget. `reap.py --status` prints the
+current counts per status and changes nothing.
+
+If the file is deleted but unmonitoring then fails, the row is still marked
+`deleted` (the file really is gone) and the failure is logged at ERROR — that is
+the one case where Lidarr may re-download the song.
+
+### Scheduling
+
+Run it from cron on **the host that holds `ratings.db`** — the same machine as
+`listener.py`. It does not need the music share mounted (deletion goes through
+Lidarr's API); it needs the database, `config.ini`, and HTTP access to Lidarr and
+Navidrome.
+
+```cron
+# Reap disliked songs nightly. Absolute paths only -- cron has no useful cwd or
+# PATH, and both are fine here: reap.py resolves config.ini and ratings.db from
+# its own location, and Python puts the script's directory on sys.path, so no
+# `cd` and no PYTHONPATH are needed.
+23 4 * * * /opt/scripts/.venv/bin/python /opt/scripts/media_tracker/reap.py --apply 2>&1 | logger -t media-tracker-reap
+```
+
+`crontab -e` as the account that owns `ratings.db`, then read it back with:
+
+```bash
+journalctl -t media-tracker-reap -n 50      # or: grep media-tracker-reap /var/log/syslog
+```
+
+The `| logger` matters: reap.py logs a couple of lines at INFO on **every** run,
+including when there is nothing to do, and cron emails anything a job writes to
+stdout or stderr. Without the pipe you get mail nightly. Pipe it to `logger` (as
+above), redirect to a file you can rotate, or add `MAILTO=""` at the top of the
+crontab if you want it silent — but then a genuine failure is silent too, so
+prefer the log.
+
+Note that `| logger` makes the pipeline's exit status `logger`'s, so cron will
+not see a failing run. The exit code is there for interactive use and for
+whatever you wire up; the ERROR lines in the log are what to alert on.
+
+While you are still building trust in the path matching, drop `--apply` from the
+cron line for a few days and read the log — it will print what it *would* have
+deleted without touching anything.
+
+### Upgrading an existing install
+
+The new `reap_*` columns are added by an `ALTER TABLE` that runs when either
+process next opens the database, and the old listener is unaffected by them:
+inserts name their columns explicitly, `reap_attempts` has a `DEFAULT`, and reads
+go through `sqlite3.Row` by name. So the listener can keep running across the
+deploy — there is no required restart, and no ordering requirement between
+updating the listener and first running the reaper.
+
+### Config
+
+```ini
+[lidarr]
+url: https://lidarr.wrycu.com
+api_key: ...          ; Settings -> General -> Security -> API Key
+enabled: true         ; false forces a dry run even with --apply
+
+[navidrome_api]
+url: https://music.wrycu.com
+username: ...         ; any Navidrome user; read-only is fine
+password: ...         ; sent as a salted token, never in clear
+```
+
 ## Notes & limitations
 
 - **Playlist attribution is best-effort.** Navidrome does not record which playlist
@@ -103,3 +303,8 @@ You should get a Slack DM. Inspect results with
   Jellyfin flow — every Navidrome user's plays are DMed to that one person.
 - Not implemented: expiring stale unanswered prompts, and rate-limiting during a
   long listening session (one DM per finished song adds up).
+- The reaper unmonitors whole albums, because Lidarr cannot monitor a single
+  track. One disliked song on an album you otherwise like will stop that album
+  being upgraded or re-fetched.
+- Nothing un-does a reap. The rating stays in `ratings.db`, so re-monitoring the
+  album in Lidarr and re-downloading is a manual job.

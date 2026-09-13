@@ -18,3 +18,18 @@ slack_user_id: U00000000
 plugin_shared_secret: change-me
 ; Relative paths resolve against the repo root (next to this file).
 db_path: ratings.db
+
+[lidarr]
+; Lidarr instance and API key (Settings -> General -> Security -> API Key).
+url: https://lidarr.example.com
+api_key: your-lidarr-api-key
+; Delete the disliked track's file via Lidarr, and unmonitor its album so
+; Lidarr does not re-download it. Set to false to log the plan without acting.
+enabled: true
+
+[navidrome_api]
+; Subsonic API credentials, used to resolve a track_id to its file path.
+; Any Navidrome user works; a read-only account is fine.
+url: https://music.example.com
+username: your-navidrome-user
+password: your-navidrome-password
