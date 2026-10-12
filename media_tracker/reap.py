@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Delete songs you disliked in Slack, and stop Lidarr from fetching them again.
+"""Clear judged songs out of the library, so Navidrome only plays unjudged ones.
 
-Run on a schedule. For every `dislike` in ratings.db that has not been dealt
+Run on a schedule. For every rated song in ratings.db that has not been dealt
 with yet:
 
   1. resolve the Navidrome track_id to a file path (Subsonic `getSong`),
   2. find the matching Lidarr track file by path,
-  3. delete it through Lidarr, and unmonitor the album so it is not re-grabbed.
+  3. dislike: delete it through Lidarr;
+     like:    copy it into `liked_root`, then delete the original through Lidarr,
+              recording the MusicBrainz ids needed to re-add it later,
+  4. unmonitor the album so neither is re-grabbed.
 
 Deleting through Lidarr rather than with os.remove keeps Lidarr's database
-honest and means this can run somewhere that has no access to the music share.
+honest. Disliked songs need no access to the music share; liked songs do, since
+the file has to be copied somewhere.
 
-Lidarr has no per-track monitoring, so step 3 unmonitors the *whole album* —
+Lidarr has no per-track monitoring, so step 4 unmonitors the *whole album* —
 nothing else on that album will be fetched or upgraded afterwards.
 
 Dry run by default; pass --apply to actually delete anything.
@@ -23,9 +27,11 @@ Dry run by default; pass --apply to actually delete anything.
 import argparse
 import logging
 import os
+import shutil
 import sys
 import unicodedata
 from pathlib import Path
+from typing import NamedTuple
 
 import lidarr as lidarr_api
 import navidrome
@@ -38,6 +44,8 @@ logger = logging.getLogger("reap")
 # retried on the next run; everything else is terminal and recorded.
 STATUS_DELETED = "deleted"      # removed via lidarr, album unmonitored
 STATUS_DELETED_DISK = "deleted-on-disk"  # removed directly; lidarr does not track it
+STATUS_KEPT = "kept"            # liked: moved to liked_root via lidarr, album unmonitored
+STATUS_KEPT_DISK = "kept-on-disk"  # liked: moved directly; lidarr does not track it
 STATUS_MISSING = "missing"      # already gone from Navidrome; nothing to delete
 STATUS_UNMATCHED = "unmatched"  # Navidrome knows it, Lidarr does not
 STATUS_FAILED = "failed"        # kept erroring; gave up after MAX_ATTEMPTS
@@ -62,6 +70,9 @@ WOULD_ACT = object()
 SUSPECT_LIMIT = 10
 
 RETRYABLE = (STATUS_UNMATCHED, STATUS_FAILED)
+
+# Outcomes that changed the library, and so count towards --limit.
+ACTED = (STATUS_DELETED, STATUS_DELETED_DISK, STATUS_KEPT, STATUS_KEPT_DISK)
 
 # How many times a song may fail transiently before we stop queueing it. Without
 # a cap, a song that fails for a durable reason that merely looks transient is
@@ -237,6 +248,25 @@ def looks_synthesized(song, basename: str) -> bool:
     return _norm(basename) == _norm(expected)
 
 
+def check_liked_root(liked_root: str, disk_root: str) -> str | None:
+    """Why liked_root is unusable, or None if it is fine.
+
+    It must not overlap the library: inside it, Navidrome would scan the kept
+    songs and play them again, defeating the point; containing it, the next
+    reap could find kept songs as library files.
+    """
+    liked = Path(liked_root)
+    if not liked.is_dir():
+        return f"{liked_root!r} is not a directory on this host"
+    if not disk_root:
+        return None
+    liked, music = liked.resolve(), Path(disk_root).resolve()
+    if liked == music or music in liked.parents or liked in music.parents:
+        return (f"{liked} overlaps music_root {music}; it must be outside "
+                "every library Navidrome scans")
+    return None
+
+
 def resolve_disk_path(disk_root: str, navidrome_path: str,
                       navidrome_root: str = "") -> Path | None:
     """Turn Navidrome's path into an absolute file to delete, or None to refuse.
@@ -296,6 +326,41 @@ def resolve_disk_path(disk_root: str, navidrome_path: str,
     return parent / target.name
 
 
+def disk_file(path, song, label, *, disk_root, navidrome_root=""):
+    """Find the regular file on this host behind Navidrome's path.
+
+    Returns (Path, None), or (None, outcome) where outcome is a status or one of
+    the SUSPECT_MISSING / SYNTHESIZED_PATH sentinels.
+    """
+    target = resolve_disk_path(disk_root, path, navidrome_root)
+    if target is None:
+        return None, STATUS_UNMATCHED
+
+    if not target.exists() and not target.is_symlink():
+        # A missing file only means "already deleted" if the library around it is
+        # actually there. If the album directory is missing too, the tree is not
+        # mounted or music_root is wrong, and concluding the song was deleted
+        # would terminally write off songs whose files are fine.
+        if looks_synthesized(song, target.name):
+            logger.error(
+                "%s: navidrome reported %r, which is a filename built from tags, "
+                "not the real one. Set ND_SUBSONIC_DEFAULTREPORTREALPATH=true (or "
+                "enable 'Report Real Path' for the %s player in navidrome's "
+                "Players settings) and run again.",
+                label, target.name, subsonic_api.CLIENT_NAME)
+            return None, SYNTHESIZED_PATH
+        if not target.parent.is_dir():
+            logger.warning("SKIP  %s: %s does not exist — is music_root right and "
+                           "the library mounted?", label, target.parent)
+        else:
+            logger.info("SKIP  %s: not on disk at %s", label, target)
+        return None, SUSPECT_MISSING
+    if target.is_dir():
+        logger.warning("REFUSING %s: %s is a directory", label, target)
+        return None, STATUS_UNMATCHED
+    return target, None
+
+
 def delete_from_disk(path, song, label, *, disk_root, apply_changes,
                      navidrome_root=""):
     """Delete a file Lidarr does not track. Returns (status, path).
@@ -312,32 +377,10 @@ def delete_from_disk(path, song, label, *, disk_root, apply_changes,
         logger.debug("SKIP  %s: not in lidarr and no music_root configured", label)
         return None, None
 
-    target = resolve_disk_path(disk_root, path, navidrome_root)
+    target, problem = disk_file(path, song, label, disk_root=disk_root,
+                                navidrome_root=navidrome_root)
     if target is None:
-        return STATUS_UNMATCHED, None
-
-    if not target.exists() and not target.is_symlink():
-        # A missing file only means "already deleted" if the library around it is
-        # actually there. If the album directory is missing too, the tree is not
-        # mounted or music_root is wrong, and concluding the song was deleted
-        # would terminally write off songs whose files are fine.
-        if looks_synthesized(song, target.name):
-            logger.error(
-                "%s: navidrome reported %r, which is a filename built from tags, "
-                "not the real one. Set ND_SUBSONIC_DEFAULTREPORTREALPATH=true (or "
-                "enable 'Report Real Path' for the %s player in navidrome's "
-                "Players settings) and run again.",
-                label, target.name, subsonic_api.CLIENT_NAME)
-            return SYNTHESIZED_PATH, None
-        if not target.parent.is_dir():
-            logger.warning("SKIP  %s: %s does not exist — is music_root right and "
-                           "the library mounted?", label, target.parent)
-        else:
-            logger.info("SKIP  %s: not on disk at %s", label, target)
-        return SUSPECT_MISSING, None
-    if target.is_dir():
-        logger.warning("REFUSING %s: %s is a directory", label, target)
-        return STATUS_UNMATCHED, None
+        return problem, None
 
     if not apply_changes:
         logger.info("WOULD delete from disk %s", target)
@@ -383,37 +426,43 @@ def _verified_album(lidarr, album_id, matched_artist, song):
     return album
 
 
-def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None,
-            navidrome_root=""):
-    """Handle one disliked song.
+class Found(NamedTuple):
+    """A rated song identified in Navidrome, and in Lidarr when it tracks it."""
+    label: str
+    song: dict
+    path: str                       # as navidrome reports it
+    track_file: dict | None = None  # None: lidarr does not track this file
+    artist: dict | None = None      # the lidarr artist the track file belongs to
+    album: dict | None = None       # verified; the album that will be unmonitored
 
-    Returns (status, path): a terminal status and the file removed, or
-    (None, None) when there is nothing terminal to record (a dry run).
 
-    Raises on transient failures (network, HTTP) so the caller can count the
-    attempt and retry on a later run.
+def locate(row, subsonic, lidarr, *, navidrome_root=""):
+    """Identify the file behind a rated row, in Navidrome and then Lidarr.
+
+    Returns (Found, None), or (None, status) when the song must be left alone.
+    Raises on transient failures.
     """
     label = f"{row['title'] or '?'} — {row['artist'] or '?'}"
 
     song, refusal = resolve_song(subsonic, row)
     if song is None:
         if refusal == STATUS_MISSING:
-            logger.info("SKIP  %s: not in navidrome (already deleted?)", label)
+            logger.info("SKIP  %s: not in navidrome (already removed?)", label)
         else:
             logger.warning("SKIP  %s: could not identify the track with confidence",
                            label)
-        return refusal, None
+        return None, refusal
 
     path = song.get("path")
     if not path:
         logger.warning("SKIP  %s: navidrome returned no path", label)
-        return STATUS_UNMATCHED, None
+        return None, STATUS_UNMATCHED
 
     if not in_managed_library(path, navidrome_root):
         # Checked before the lidarr lookup, so an out-of-scope library is skipped
         # whole rather than partly deleted via whichever route happens to reach it.
         logger.info("SKIP  %s: in another navidrome library (%s)", label, path)
-        return STATUS_OUT_OF_SCOPE, None
+        return None, STATUS_OUT_OF_SCOPE
 
     match = lidarr.find_track_file(
         path=path,
@@ -422,13 +471,11 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
     )
     if match is None:
         # Lidarr manages only part of most libraries; anything it has never
-        # imported can still be removed straight from disk. The path came from
+        # imported can still be handled straight on disk. The path came from
         # Navidrome's record for a song we already verified against the rated
         # row, so it identifies the file directly rather than by fuzzy matching.
         logger.debug("%s: not in lidarr; falling back to disk", label)
-        return delete_from_disk(path, song, label, disk_root=disk_root,
-                                apply_changes=apply_changes,
-                                navidrome_root=navidrome_root)
+        return Found(label, song, path), None
     track_file, matched_artist = match
 
     # Confirm the album before touching anything: unmonitoring is the one action
@@ -438,42 +485,215 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
     album = _verified_album(lidarr, album_id, matched_artist, song)
     if album_id and album is None:
         logger.warning("SKIP  %s: could not confirm the album to unmonitor", label)
-        return STATUS_UNMATCHED, None
+        return None, STATUS_UNMATCHED
+    return Found(label, song, path, track_file, matched_artist, album), None
+
+
+def _unmonitor(lidarr, found, unmonitored, verb):
+    """Unmonitor the album of a file that has just left the library.
+
+    The file is gone either way; a failure to unmonitor must not lose that fact,
+    so it is logged loudly rather than raised.
+    """
+    album_id = found.track_file.get("albumId")
+    if not album_id or album_id in unmonitored:
+        return
+    try:
+        lidarr.set_album_monitored(album_id, False)
+        unmonitored.add(album_id)
+        logger.info("UNMONITORED %r by %r (album %s)",
+                    (found.album or {}).get("title"),
+                    found.artist.get("artistName"), album_id)
+    except lidarr_api.LidarrError:
+        logger.exception(
+            "%s %s but FAILED to unmonitor album %s — lidarr may re-download it",
+            verb, found.label, album_id,
+        )
+
+
+def reap_song(found, lidarr, *, apply_changes, unmonitored, disk_root=None,
+              navidrome_root=""):
+    """Delete a disliked song. Returns (status, path removed)."""
+    if found.track_file is None:
+        return delete_from_disk(found.path, found.song, found.label,
+                                disk_root=disk_root, apply_changes=apply_changes,
+                                navidrome_root=navidrome_root)
+    track_file = found.track_file
 
     if not apply_changes:
         logger.info("WOULD delete %s", track_file.get("path"))
         logger.info("      and unmonitor %r by %r (album %s)",
-                    (album or {}).get("title"), matched_artist.get("artistName"),
-                    album_id)
+                    (found.album or {}).get("title"),
+                    found.artist.get("artistName"), track_file.get("albumId"))
         return WOULD_ACT, None
 
     lidarr.delete_track_file(track_file["id"])
     logger.info("DELETED %s (trackFile %s)", track_file.get("path"), track_file["id"])
-
-    # The file is gone either way; a failure to unmonitor must not lose that fact,
-    # so it is logged loudly rather than raised.
-    if album_id and album_id not in unmonitored:
-        try:
-            lidarr.set_album_monitored(album_id, False)
-            unmonitored.add(album_id)
-            logger.info("UNMONITORED %r by %r (album %s)",
-                        (album or {}).get("title"),
-                        matched_artist.get("artistName"), album_id)
-        except lidarr_api.LidarrError:
-            logger.exception(
-                "deleted %s but FAILED to unmonitor album %s — lidarr may re-download it",
-                label, album_id,
-            )
+    _unmonitor(lidarr, found, unmonitored, "deleted")
     return STATUS_DELETED, track_file.get("path")
+
+
+def liked_destination(source: Path, disk_root: str, liked_root: str) -> Path:
+    """Where a liked file goes: the same Artist/Album/file layout, under
+    liked_root. `source` came from disk_file(), so it is already inside the
+    resolved music root and the relative part cannot climb out."""
+    relative = source.relative_to(Path(disk_root).resolve())
+    return Path(liked_root).resolve() / relative
+
+
+def _copy_verified(source: Path, dest: Path) -> None:
+    """Copy source to dest so dest only ever appears complete.
+
+    Written under a hidden temporary name and renamed into place, so a crash
+    mid-copy leaves no truncated file that a later run would mistake for done.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(f".{dest.name}.partial")
+    shutil.copy2(source, partial)
+    if partial.stat().st_size != source.stat().st_size:
+        partial.unlink()
+        raise OSError(f"copy of {source} is the wrong size; not keeping it")
+    os.replace(partial, dest)
+
+
+def retained_ids(lidarr, found) -> dict:
+    """What is needed to put a kept song back under Lidarr later.
+
+    Lidarr adds artists and albums by MusicBrainz id, so those are the durable
+    keys; Lidarr's own album id is kept too, but it only means something to
+    this Lidarr instance. Navidrome's tag-read recording id stands in when
+    Lidarr does not track the file.
+    """
+    ids = {"mb_recording_id": found.song.get("musicBrainzId") or None}
+    if found.track_file is None:
+        return ids
+    album_id = found.track_file.get("albumId")
+    ids["lidarr_album_id"] = album_id
+    ids["mb_artist_id"] = found.artist.get("foreignArtistId")
+    ids["mb_album_id"] = (found.album or {}).get("foreignAlbumId")
+    if album_id:
+        for track in lidarr.tracks(album_id):
+            if track.get("trackFileId") == found.track_file["id"]:
+                ids["mb_recording_id"] = (track.get("foreignRecordingId")
+                                          or ids["mb_recording_id"])
+                break
+    return ids
+
+
+def keep_song(found, lidarr, *, apply_changes, unmonitored, disk_root,
+              liked_root, navidrome_root=""):
+    """Move a liked song out of the library into liked_root.
+
+    Returns (status, path removed, retained ids).
+
+    The copy is made and checked *before* the original is removed, so at no
+    point does the only copy of a song you like depend on a step that has not
+    happened yet. The original is then removed through Lidarr when it tracks
+    the file, exactly like a deletion, and the album unmonitored -- otherwise
+    Lidarr would see a missing track and fetch it straight back.
+    """
+    label = found.label
+    source, problem = disk_file(found.path, found.song, label,
+                                disk_root=disk_root, navidrome_root=navidrome_root)
+    if source is None:
+        return problem, None, {}
+
+    track_file = found.track_file
+    if track_file is not None:
+        # The path match got us here; the size proves the file we are about to
+        # copy is the very one lidarr is about to delete, not a namesake.
+        expected = track_file.get("size")
+        if expected is not None and expected != source.stat().st_size:
+            logger.warning("REFUSING %s: %s is %d bytes but lidarr's file is %d",
+                           label, source, source.stat().st_size, expected)
+            return STATUS_UNMATCHED, None, {}
+
+    dest = liked_destination(source, disk_root, liked_root)
+    resumed = False
+    if dest.exists() or dest.is_symlink():
+        # liked_root is ours alone, so a same-size file at the same relative path
+        # is this song from a run that stopped after copying. Anything else is a
+        # collision, and overwriting it could destroy a song kept earlier.
+        if dest.is_file() and dest.stat().st_size == source.stat().st_size:
+            resumed = True
+        else:
+            logger.warning("REFUSING %s: %s already exists and differs", label, dest)
+            return STATUS_UNMATCHED, None, {}
+
+    ids = retained_ids(lidarr, found)
+
+    if not apply_changes:
+        logger.info("WOULD move %s", source)
+        logger.info("      to   %s", dest)
+        if track_file is not None:
+            logger.info("      and unmonitor %r by %r (album %s)",
+                        (found.album or {}).get("title"),
+                        found.artist.get("artistName"), track_file.get("albumId"))
+        else:
+            logger.info("      (not in lidarr, so nothing to unmonitor)")
+        return WOULD_ACT, None, {}
+
+    if not resumed:
+        _copy_verified(source, dest)
+    logger.info("COPIED %s -> %s", source, dest)
+
+    if track_file is None:
+        os.unlink(source)
+        logger.info("KEPT  %s (removed from library on disk)", label)
+        return STATUS_KEPT_DISK, str(source), {"kept_path": str(dest), **ids}
+
+    try:
+        lidarr.delete_track_file(track_file["id"])
+    except Exception:
+        # The original is still in place, so drop the copy: the next run starts
+        # clean rather than finding a stray duplicate in liked_root.
+        dest.unlink(missing_ok=True)
+        raise
+    logger.info("KEPT  %s (trackFile %s removed via lidarr)", label, track_file["id"])
+    _unmonitor(lidarr, found, unmonitored, "kept")
+    return STATUS_KEPT, track_file.get("path"), {"kept_path": str(dest), **ids}
+
+
+def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None,
+            navidrome_root="", liked_root=None):
+    """Handle one rated song: delete it if disliked, move it out if liked.
+
+    Returns (status, path, retained): a terminal status, the file removed from
+    the library, and for a kept song the columns needed to restore it. Status is
+    None when there is nothing terminal to record (a dry run, or a song this
+    configuration cannot handle yet).
+
+    Raises on transient failures (network, HTTP) so the caller can count the
+    attempt and retry on a later run.
+    """
+    if row["rating"] == navidrome.RATING_LIKE and not (liked_root and disk_root):
+        # Like a missing music_root for deletions: a fact about configuration,
+        # so not terminal, and reported once at startup rather than per song.
+        logger.debug("SKIP  %s: liked, and liked_root/music_root not configured",
+                     row["title"])
+        return None, None, {}
+
+    found, refusal = locate(row, subsonic, lidarr, navidrome_root=navidrome_root)
+    if found is None:
+        return refusal, None, {}
+
+    if row["rating"] == navidrome.RATING_LIKE:
+        return keep_song(found, lidarr, apply_changes=apply_changes,
+                         unmonitored=unmonitored, disk_root=disk_root,
+                         liked_root=liked_root, navidrome_root=navidrome_root)
+    status, path = reap_song(found, lidarr, apply_changes=apply_changes,
+                             unmonitored=unmonitored, disk_root=disk_root,
+                             navidrome_root=navidrome_root)
+    return status, path, {}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true",
-                        help="actually delete and unmonitor (default: dry run)")
+                        help="actually delete/move and unmonitor (default: dry run)")
     parser.add_argument("--limit", type=int, metavar="N",
-                        help="stop after N deletions (skips do not count, so a "
+                        help="stop after N deletions or moves (skips do not count, so a "
                              "run of out-of-scope songs cannot consume it)")
     parser.add_argument("--retry", choices=(*RETRYABLE, "all"), metavar="STATUS",
                         help="requeue songs already recorded as unmatched or failed, "
@@ -506,10 +726,10 @@ def main(argv=None):
 
     if args.status:
         for row in store.reap_summary():
-            logger.info("%-10s %d", row["status"], row["n"])
+            logger.info("%-8s %-15s %d", row["rating"], row["status"], row["n"])
         return 0
 
-    rows = store.unreaped_dislikes(MAX_ATTEMPTS)
+    rows = store.unreaped(MAX_ATTEMPTS)
 
     if args.retry:
         wanted = RETRYABLE if args.retry == "all" else (args.retry,)
@@ -540,8 +760,8 @@ def main(argv=None):
             logger.info("lidarr knows %d artists", len(lidarr.artists()))
             return diagnose(rows, subsonic, lidarr)
 
-    logger.info("%d disliked song(s) to process%s",
-                len(rows), "" if args.apply else " (dry run — nothing will be deleted)")
+    logger.info("%d rated song(s) to process%s",
+                len(rows), "" if args.apply else " (dry run — nothing will change)")
 
     navidrome_root = config.get("navidrome_api", "navidrome_root",
                                 fallback="").strip()
@@ -559,11 +779,22 @@ def main(argv=None):
             "track will be left queued, not deleted. Set music_root to "
             "navidrome's library root to handle them.")
 
+    liked_root = config.get("navidrome_api", "liked_root", fallback="").strip()
+    if liked_root:
+        problem = check_liked_root(liked_root, disk_root)
+        if problem:
+            logger.error("liked_root: %s", problem)
+            return 2
+    if not (liked_root and disk_root):
+        logger.warning(
+            "liked_root and music_root are not both set in [navidrome_api]: liked "
+            "songs will be left queued, not moved out of the library.")
+
     counts = {}
     failures = 0
     acted = 0
     suspect = 0
-    disk_deleted = 0
+    disk_confirmed = 0
     unmonitored = set()
     with subsonic_api.Subsonic(
         config.get("navidrome_api", "url"),
@@ -580,10 +811,11 @@ def main(argv=None):
 
         for row in rows:
             try:
-                status, path = process(row, subsonic, lidarr,
+                status, path, retained = process(row, subsonic, lidarr,
                                        apply_changes=args.apply,
                                        unmonitored=unmonitored,
                                        disk_root=disk_root,
+                                       liked_root=liked_root,
                                        navidrome_root=navidrome_root)
             except Exception:
                 failures += 1
@@ -612,7 +844,7 @@ def main(argv=None):
                 return 2
             if status is SUSPECT_MISSING:
                 suspect += 1
-                if suspect >= SUSPECT_LIMIT and not disk_deleted \
+                if suspect >= SUSPECT_LIMIT and not disk_confirmed \
                         and not args.accept_missing:
                     logger.error(
                         "aborting: %d songs in a row are not at the paths navidrome "
@@ -626,23 +858,26 @@ def main(argv=None):
                     return 2
                 # Once the scheme has been shown to work, an absent file really is
                 # a file someone deleted earlier.
-                if disk_deleted or args.accept_missing:
+                if disk_confirmed or args.accept_missing:
                     if args.apply:
                         store.mark_reaped(row["event_id"], STATUS_MISSING)
                     counts[STATUS_MISSING] = counts.get(STATUS_MISSING, 0) + 1
                 continue
             suspect = 0
-            if status == STATUS_DELETED_DISK:
-                disk_deleted += 1
+            # Any file actually found and handled on disk proves the path scheme.
+            if status in (STATUS_DELETED_DISK, STATUS_KEPT, STATUS_KEPT_DISK):
+                disk_confirmed += 1
 
             if status is WOULD_ACT:
-                counts["would-delete"] = counts.get("would-delete", 0) + 1
+                would = ("would-keep" if row["rating"] == navidrome.RATING_LIKE
+                         else "would-delete")
+                counts[would] = counts.get(would, 0) + 1
                 acted += 1
             elif status is not None:
                 if args.apply:
-                    store.mark_reaped(row["event_id"], status, path)
+                    store.mark_reaped(row["event_id"], status, path, retained)
                 counts[status] = counts.get(status, 0) + 1
-                if status in (STATUS_DELETED, STATUS_DELETED_DISK):
+                if status in ACTED:
                     acted += 1
 
             if args.limit and acted >= args.limit:

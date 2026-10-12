@@ -23,8 +23,9 @@ db_path: ratings.db
 ; Lidarr instance and API key (Settings -> General -> Security -> API Key).
 url: https://lidarr.example.com
 api_key: your-lidarr-api-key
-; Delete the disliked track's file via Lidarr, and unmonitor its album so
-; Lidarr does not re-download it. Set to false to log the plan without acting.
+; Delete the disliked (or moved-out liked) track's file via Lidarr, and
+; unmonitor its album so Lidarr does not re-download it. Set to false to log
+; the plan without acting.
 enabled: true
 
 [navidrome_api]
@@ -43,5 +44,11 @@ url: https://music.example.com
 ; filenames from tags and nothing will be found on disk.
 navidrome_root: /music
 music_root: /path/to/music
+; Liked songs are moved here (as Artist/Album/file) and removed from the
+; library, so Navidrome only plays songs you have not judged yet. Must be a
+; directory on this host OUTSIDE music_root and outside every Navidrome
+; library and Lidarr root folder. Needs music_root too. Leave blank to leave
+; liked songs where they are.
+liked_root:
 username: your-navidrome-user
 password: your-navidrome-password

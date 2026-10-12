@@ -28,13 +28,25 @@ CREATE TABLE IF NOT EXISTS ratings (
     created_at       TEXT NOT NULL,
     responded_at     TEXT,
     reaped_at        TEXT,                             -- when the reaper acted
-    reap_status      TEXT,                             -- deleted | missing | unmatched | failed
+    reap_status      TEXT,                             -- deleted | kept | missing | unmatched | failed
     reaped_path      TEXT,                             -- the file we actually removed
-    reap_attempts    INTEGER NOT NULL DEFAULT 0        -- bounds retries of transient errors
+    reap_attempts    INTEGER NOT NULL DEFAULT 0,       -- bounds retries of transient errors
+    -- Liked songs are moved out of the library rather than deleted. Enough is
+    -- kept here to put them back under Lidarr later.
+    kept_path        TEXT,                             -- where the liked file now lives
+    lidarr_album_id  INTEGER,
+    mb_artist_id     TEXT,                             -- MusicBrainz artist
+    mb_album_id      TEXT,                             -- MusicBrainz release group (Lidarr's album)
+    mb_recording_id  TEXT                              -- MusicBrainz recording
 );
 CREATE INDEX IF NOT EXISTS idx_ratings_track
     ON ratings (navidrome_user, track_id);
 """
+
+# Columns mark_reaped may fill for a liked song. A fixed set, because the names
+# are interpolated into SQL.
+RETAINED_COLUMNS = ("kept_path", "lidarr_album_id", "mb_artist_id",
+                    "mb_album_id", "mb_recording_id")
 
 # Serialise the read-modify-write in set_rating across threads.
 _lock = threading.Lock()
@@ -58,9 +70,12 @@ class Database:
         SQLite has no ADD COLUMN IF NOT EXISTS, so check what is already there.
         """
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(ratings)")}
-        for column in ("reaped_at", "reap_status", "reaped_path"):
+        for column in ("reaped_at", "reap_status", "reaped_path", "kept_path",
+                       "mb_artist_id", "mb_album_id", "mb_recording_id"):
             if column not in existing:
                 conn.execute(f"ALTER TABLE ratings ADD COLUMN {column} TEXT")
+        if "lidarr_album_id" not in existing:
+            conn.execute("ALTER TABLE ratings ADD COLUMN lidarr_album_id INTEGER")
         if "reap_attempts" not in existing:
             conn.execute(
                 "ALTER TABLE ratings ADD COLUMN reap_attempts INTEGER NOT NULL DEFAULT 0"
@@ -168,8 +183,9 @@ class Database:
                 ).fetchone()
             return row is not None
 
-    def unreaped_dislikes(self, max_attempts: int) -> list[sqlite3.Row]:
-        """The reaper's work queue: disliked songs not yet dealt with, oldest first.
+    def unreaped(self, max_attempts: int) -> list[sqlite3.Row]:
+        """The reaper's work queue: rated songs not yet dealt with, oldest first.
+        Disliked songs are deleted, liked ones moved out of the library.
 
         Two things keep this queue from growing without bound. A row that reaches
         a terminal outcome gets `reaped_at` set and never returns. A row that
@@ -182,23 +198,31 @@ class Database:
             return conn.execute(
                 """
                 SELECT * FROM ratings
-                WHERE rating = 'dislike' AND reaped_at IS NULL AND reap_attempts < ?
+                WHERE rating IS NOT NULL AND reaped_at IS NULL AND reap_attempts < ?
                 ORDER BY responded_at
                 """,
                 (max_attempts,),
             ).fetchall()
 
-    def mark_reaped(self, event_id: str, status: str, path: str | None = None) -> None:
+    def mark_reaped(self, event_id: str, status: str, path: str | None = None,
+                    retained: dict | None = None) -> None:
         """Record a terminal outcome. `path` is the file that was actually removed,
-        kept as an audit trail of what the job has deleted."""
+        kept as an audit trail of what the job has deleted. `retained` holds the
+        RETAINED_COLUMNS for a liked song that was moved out of the library."""
+        retained = {k: v for k, v in (retained or {}).items() if v is not None}
+        unknown = set(retained) - set(RETAINED_COLUMNS)
+        if unknown:
+            raise ValueError(f"not retained columns: {sorted(unknown)}")
+        extra = "".join(f", {column} = ?" for column in retained)
         with self._connect() as conn:
             conn.execute(
-                """
+                f"""
                 UPDATE ratings
                 SET reaped_at = ?, reap_status = ?, reaped_path = COALESCE(?, reaped_path)
+                    {extra}
                 WHERE event_id = ?
                 """,
-                (_now(), status, path, event_id),
+                (_now(), status, path, *retained.values(), event_id),
             )
 
     def record_attempt(self, event_id: str) -> int:
@@ -223,7 +247,7 @@ class Database:
         """
         with self._connect() as conn:
             return conn.execute(
-                "SELECT * FROM ratings WHERE rating = 'dislike' AND reap_status = ?"
+                "SELECT * FROM ratings WHERE rating IS NOT NULL AND reap_status = ?"
                 " ORDER BY responded_at",
                 (status,),
             ).fetchall()
@@ -244,12 +268,12 @@ class Database:
             )
 
     def reap_summary(self) -> list[sqlite3.Row]:
-        """Counts per reap_status, for --status."""
+        """Counts per rating and reap_status, for --status."""
         with self._connect() as conn:
             return conn.execute(
                 """
-                SELECT COALESCE(reap_status, 'queued') AS status, COUNT(*) AS n
-                FROM ratings WHERE rating = 'dislike'
-                GROUP BY 1 ORDER BY 1
+                SELECT rating, COALESCE(reap_status, 'queued') AS status, COUNT(*) AS n
+                FROM ratings WHERE rating IS NOT NULL
+                GROUP BY 1, 2 ORDER BY 1, 2
                 """
             ).fetchall()

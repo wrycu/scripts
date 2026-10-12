@@ -9,7 +9,10 @@ Two sources feed it:
 | Jellyfin      | `POST /watch`    | 1–5 stars   | YamTracker (`media_save`) |
 | Navidrome     | `POST /scrobble` | 👍 / 👎     | `ratings.db` (SQLite)     |
 
-Disliked songs are then cleaned up off-line by [`reap.py`](#reaping-disliked-songs).
+Judged songs are then cleared out of the library off-line by
+[`reap.py`](#reaping-disliked-songs): disliked ones deleted, liked ones
+[moved aside](#keeping-liked-songs). Navidrome is left playing only songs you
+have not judged yet.
 
 Both prompts come back through the same **`POST /slack`** endpoint, which verifies
 the Slack signature and routes on the button's `value`.
@@ -94,8 +97,9 @@ You should get a Slack DM. Inspect results with
 
 ## Reaping disliked songs
 
-`reap.py` deletes the songs you gave a 👎 and stops Lidarr from fetching them
-again. It is a scheduled batch job, not part of the request path — clicking
+`reap.py` deletes the songs you gave a 👎, moves the ones you gave a 👍 out of
+the library (see [below](#keeping-liked-songs)), and stops Lidarr from fetching
+either again. It is a scheduled batch job, not part of the request path — clicking
 Dislike only records the answer.
 
 ```
@@ -250,6 +254,8 @@ work does not pile up run after run:
 |-------------|-----------------------------------------------------------------|
 | `deleted`   | removed via Lidarr, album unmonitored                            |
 | `deleted-on-disk` | removed directly; Lidarr does not track it, so nothing to unmonitor |
+| `kept`      | liked: moved to `liked_root`, original removed via Lidarr, album unmonitored |
+| `kept-on-disk` | liked: moved to `liked_root` directly; Lidarr does not track it |
 | `out-of-scope` | in a different Navidrome library; not this job's to manage      |
 | `missing`   | already gone from Navidrome — nothing left to delete             |
 | `unmatched` | could not be identified with confidence — left alone, see above  |
@@ -346,7 +352,72 @@ enabled: true         ; false forces a dry run even with --apply
 url: https://music.wrycu.com
 username: ...         ; any Navidrome user; read-only is fine
 password: ...         ; sent as a salted token, never in clear
+music_root: ...       ; the library as this host sees it
+liked_root: ...       ; where liked songs go; blank = leave them in place
 ```
+
+## Keeping liked songs
+
+A 👍 moves the song **out** of the library, into `liked_root`, by the same job
+and through the same identification and safety checks as a deletion. The goal is
+that Navidrome only ever plays songs you have not passed judgement on.
+
+```
+ratings.db (rating='like')
+      │  same lookup as a dislike: Navidrome path -> Lidarr trackFile, album verified
+      ▼
+copy  <music_root>/Artist/Album/x.flac ──▶ <liked_root>/Artist/Album/x.flac   (size checked)
+      │
+      ▼
+remove the original  ── via Lidarr: DELETE trackfile, then unmonitor the album
+                     └─ not in Lidarr: unlink it
+```
+
+- **Copy first, then remove.** The copy is written under a hidden `.partial`
+  name, size-checked and renamed into place before the original is touched. If
+  Lidarr then refuses the delete, the copy is removed again and the song retried
+  next run, so a liked song is never in a state where only half of it exists.
+- **Unmonitoring is what stops the re-download.** Lidarr would otherwise see a
+  monitored album with a missing track and fetch it straight back. As with
+  dislikes, this is album-wide.
+- **The size must agree with Lidarr's record** of the file, proving the file
+  copied is the one Lidarr is about to delete.
+- **Never overwrites.** If `liked_root` already holds a *different* file at the
+  same path, the song is marked `unmatched` and left alone. A same-size file
+  there is taken as this song from an interrupted run, and the job carries on.
+- **`liked_root` must be outside `music_root`** — the job refuses to start
+  otherwise. It must also be outside every Navidrome library and Lidarr root
+  folder, which this host cannot check: inside Navidrome it would be scanned
+  and played again; inside Lidarr it would be imported back.
+- Needs `music_root` as well, because the file has to be read to be copied.
+  Until **both** are set, liked songs simply wait in the queue — so adding this
+  feature to a running cron changes nothing until you choose a directory, and
+  then the backlog of earlier 👍s is moved on the next run. Do a dry run first.
+
+### Putting a kept song back under Lidarr
+
+Kept rows record where the file went and the IDs Lidarr adds things by:
+
+| column            | meaning                                                  |
+|-------------------|----------------------------------------------------------|
+| `kept_path`       | the file's new location under `liked_root`               |
+| `reaped_path`     | where it used to be (Lidarr's path, or the disk path)    |
+| `mb_artist_id`    | MusicBrainz artist id (Lidarr's `foreignArtistId`)       |
+| `mb_album_id`     | MusicBrainz release group (Lidarr's `foreignAlbumId`)    |
+| `mb_recording_id` | MusicBrainz recording (from Lidarr, else Navidrome's tags) |
+| `lidarr_album_id` | Lidarr's own album id — only meaningful to this instance |
+
+```bash
+sqlite3 ../ratings.db \
+  "select artist, album, title, mb_artist_id, mb_album_id, kept_path
+   from ratings where reap_status like 'kept%' order by album;"
+```
+
+To restore one: re-monitor the album in Lidarr (or add it by searching
+`lidarr:<mb_album_id>`), and either move the file from `kept_path` back and run
+a rescan, or let Lidarr download it again. Songs Lidarr never tracked
+(`kept-on-disk`) have no artist/album ids; their title/artist/album and the
+tagged recording id are what you have.
 
 ## Notes & limitations
 
@@ -365,4 +436,7 @@ password: ...         ; sent as a salted token, never in clear
   track. One disliked song on an album you otherwise like will stop that album
   being upgraded or re-fetched.
 - Nothing un-does a reap. The rating stays in `ratings.db`, so re-monitoring the
-  album in Lidarr and re-downloading is a manual job.
+  album in Lidarr and re-downloading is a manual job (see
+  [Putting a kept song back](#putting-a-kept-song-back-under-lidarr)).
+- Moving a liked song out loses its Navidrome play count, stars and playlist
+  membership, since Navidrome drops the track on its next scan.

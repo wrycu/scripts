@@ -1,4 +1,4 @@
-"""Lidarr client for the dislike reaper.
+"""Lidarr client for the reaper (disliked songs deleted, liked songs moved out).
 
 Two jobs: find the track file backing a disliked song, and then remove it —
 deleting the file through Lidarr (so its database stays consistent and the cron
@@ -189,6 +189,11 @@ class Lidarr:
 
     def album(self, album_id: int) -> dict:
         return self._request("GET", f"album/{album_id}")
+
+    def tracks(self, album_id: int) -> list[dict]:
+        """Tracks on one album. Each carries its trackFileId and MusicBrainz
+        ids, which is how a kept song is tied back to a recording."""
+        return self._request("GET", "track", params={"albumId": album_id}) or []
 
     def set_album_monitored(self, album_id: int, monitored: bool) -> None:
         """Flip an album's monitored flag via the bulk endpoint, which is the one
