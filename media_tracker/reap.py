@@ -18,11 +18,13 @@ the file has to be copied somewhere.
 Lidarr has no per-track monitoring, so step 4 unmonitors the *whole album* —
 nothing else on that album will be fetched or upgraded afterwards.
 
-Dry run by default; pass --apply to actually delete anything.
+Pick what to act on with --disliked and/or --liked; songs with the other
+rating are left queued, untouched. Dry run by default; pass --apply to actually
+delete anything.
 
-    python reap.py                    # show what would happen
-    python reap.py --apply            # do it
-    python reap.py --apply --limit 5  # do it, but cautiously
+    python reap.py --disliked --liked                  # show what would happen
+    python reap.py --disliked --apply                  # delete disliked songs only
+    python reap.py --liked --apply --limit 5           # move liked songs, cautiously
 """
 import argparse
 import logging
@@ -690,6 +692,10 @@ def process(row, subsonic, lidarr, *, apply_changes, unmonitored, disk_root=None
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--disliked", action="store_true",
+                        help="delete disliked songs")
+    parser.add_argument("--liked", action="store_true",
+                        help="move liked songs out of the library into liked_root")
     parser.add_argument("--apply", action="store_true",
                         help="actually delete/move and unmonitor (default: dry run)")
     parser.add_argument("--limit", type=int, metavar="N",
@@ -707,6 +713,8 @@ def main(argv=None):
                              "instead of stopping to ask whether the paths are right")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if not (args.liked or args.disliked or args.status or args.diagnose):
+        parser.error("pass --disliked and/or --liked to choose what to reap")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -729,11 +737,18 @@ def main(argv=None):
             logger.info("%-8s %-15s %d", row["rating"], row["status"], row["n"])
         return 0
 
-    rows = store.unreaped(MAX_ATTEMPTS)
+    # Songs with a rating not asked for are left out entirely: untouched, still
+    # queued, and (under --retry) with their recorded state kept. --diagnose with
+    # neither flag looks at the whole queue.
+    ratings = {rating for rating, wanted in ((navidrome.RATING_LIKE, args.liked),
+                                             (navidrome.RATING_DISLIKE, args.disliked))
+               if wanted} or {navidrome.RATING_LIKE, navidrome.RATING_DISLIKE}
+    rows = [r for r in store.unreaped(MAX_ATTEMPTS) if r["rating"] in ratings]
 
     if args.retry:
         wanted = RETRYABLE if args.retry == "all" else (args.retry,)
-        requeued = [r for status in wanted for r in store.reaped_with_status(status)]
+        requeued = [r for status in wanted for r in store.reaped_with_status(status)
+                    if r["rating"] in ratings]
         if requeued and args.apply:
             # Give them a fresh budget, or a row that already burned through its
             # attempts would be dropped again the moment it errored once.
@@ -785,7 +800,7 @@ def main(argv=None):
         if problem:
             logger.error("liked_root: %s", problem)
             return 2
-    if not (liked_root and disk_root):
+    if args.liked and not (liked_root and disk_root):
         logger.warning(
             "liked_root and music_root are not both set in [navidrome_api]: liked "
             "songs will be left queued, not moved out of the library.")

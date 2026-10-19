@@ -115,11 +115,16 @@ Navidrome  getSong ──▶ file path
 
 ```bash
 cd media_tracker
-../.venv/bin/python reap.py            # dry run: prints what it would do
-../.venv/bin/python reap.py --apply    # actually delete + unmonitor
-../.venv/bin/python reap.py --apply --limit 5   # stop after 5 deletions
-../.venv/bin/python reap.py --status   # just show the queue
+../.venv/bin/python reap.py --disliked --liked          # dry run: prints what it would do
+../.venv/bin/python reap.py --disliked --apply          # delete disliked songs + unmonitor
+../.venv/bin/python reap.py --liked --apply             # move liked songs out
+../.venv/bin/python reap.py --disliked --apply --limit 5   # stop after 5 deletions
+../.venv/bin/python reap.py --status                    # just show the queue
 ```
+
+`--disliked` and `--liked` choose what to act on, and at least one is required.
+Songs with the other rating are left queued and untouched, including by
+`--retry`.
 
 `--limit` counts **deletions**, not songs examined, so a run of skipped songs
 cannot use it up — `--apply --limit 1` always means "make exactly one change".
@@ -285,7 +290,7 @@ risk guessing. An `unmatched` song is always logged with the reason.
 underlying cause — importing the album into Lidarr properly, say:
 
 ```bash
-../.venv/bin/python reap.py --apply --retry unmatched   # or: failed, all
+../.venv/bin/python reap.py --disliked --liked --apply --retry unmatched   # or: failed, all
 ```
 
 That requeues them with a fresh retry budget. `reap.py --status` prints the
@@ -307,7 +312,7 @@ Navidrome.
 # PATH, and both are fine here: reap.py resolves config.ini and ratings.db from
 # its own location, and Python puts the script's directory on sys.path, so no
 # `cd` and no PYTHONPATH are needed.
-23 4 * * * /opt/scripts/.venv/bin/python /opt/scripts/media_tracker/reap.py --apply 2>&1 | logger -t media-tracker-reap
+23 4 * * * /opt/scripts/.venv/bin/python /opt/scripts/media_tracker/reap.py --disliked --liked --apply 2>&1 | logger -t media-tracker-reap
 ```
 
 `crontab -e` as the account that owns `ratings.db`, then read it back with:
