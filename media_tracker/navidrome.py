@@ -2,7 +2,7 @@
 
 The Navidrome side of media_tracker. A sandboxed WebAssembly plugin running
 inside Navidrome POSTs a completed play to /scrobble; we DM a Like/Dislike
-prompt and store the answer when the button comes back through /slack.
+prompt and store the answer when the button comes back over Slack Socket Mode.
 
 The plugin cannot receive a Slack click or wait for a reply, which is why the
 interactive half lives here alongside the Jellyfin flow rather than in the

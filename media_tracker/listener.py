@@ -1,6 +1,8 @@
 from flask import Flask, Response, jsonify, request
-from slack_sdk.signature import SignatureVerifier
-import json
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.request import SocketModeRequest
+from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.web import WebClient
 import logging
 
 import helpers
@@ -38,23 +40,31 @@ def _dispatch_action(value):
         logger.warning("unroutable button value %r", value)
 
 
-@app.route('/slack', methods=['POST'])
-def capture_response():
-    config_obj = helpers.load_config()
-    signature_verifier = SignatureVerifier(
-        signing_secret=config_obj.get("media_tracker", "slack_signing_secret"),
-    )
-    if not signature_verifier.is_valid_request(
-        body=request.get_data(),
-        headers=dict(request.headers),
-    ):
-        return Response("Invalid signature", status=401)
-
-    resp_payload = json.loads(request.form['payload'])
-    for action in resp_payload['actions']:
-        _dispatch_action(action['value'])
+def _on_socket_request(client: SocketModeClient, req: SocketModeRequest):
+    """Handle a button click delivered over the Slack Socket Mode websocket."""
+    if req.type != "interactive":
+        return
+    # Ack before doing the work: Slack wants it within 3 seconds, and rating
+    # media can involve a slow round-trip to the backend.
+    client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+    for action in req.payload.get('actions', []):
+        try:
+            _dispatch_action(action['value'])
+        except Exception:
+            logger.exception("failed to handle button value %r", action.get('value'))
         break
-    return Response("Ok", 200)
+
+
+def start_socket_mode():
+    """Open the Socket Mode connection. Non-blocking; reconnects on its own."""
+    config_obj = helpers.load_config()
+    client = SocketModeClient(
+        app_token=config_obj.get("media_tracker", "slack_app_token"),
+        web_client=WebClient(config_obj.get("media_tracker", "slack_bot_user_oauth_token")),
+    )
+    client.socket_mode_request_listeners.append(_on_socket_request)
+    client.connect()
+    return client
 
 
 @app.route("/watch", methods=['POST'])
@@ -83,5 +93,6 @@ def capture_scrobble():
 
 
 if __name__ == '__main__':
-    # swap to 0.0.0.0 if testing the incoming Slack webhook portion
+    # Slack clicks arrive over Socket Mode; Flask only serves /watch and /scrobble.
+    socket_client = start_socket_mode()
     app.run(host="127.0.0.1", port=5190)

@@ -7,7 +7,8 @@ URL: https://track.example.com
 ; Slack app credentials (api.slack.com/apps)
 slack_client_id: 000000000000.0000000000000
 slack_client_secret: your-client-secret
-slack_signing_secret: your-signing-secret
+; app-level token with connections:write, for Socket Mode
+slack_app_token: xapp-your-app-token
 slack_bot_user_oauth_token: xoxb-your-bot-token
 ; Your Slack member ID (Profile -> Copy member ID)
 slack_user_id: U00000000

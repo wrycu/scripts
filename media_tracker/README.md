@@ -14,20 +14,21 @@ Judged songs are then cleared out of the library off-line by
 [moved aside](#keeping-liked-songs). Navidrome is left playing only songs you
 have not judged yet.
 
-Both prompts come back through the same **`POST /slack`** endpoint, which verifies
-the Slack signature and routes on the button's `value`.
+Button clicks from both prompts come back over a single Slack **Socket Mode**
+websocket opened by the listener (no public endpoint needed), and are routed on
+the button's `value`.
 
 ```
 Jellyfin  ──webhook──▶ /watch  ─┐
-                                ├─▶ Slack DM w/ buttons ──▶ /slack ──▶ dispatch by source
+                                ├─▶ Slack DM w/ buttons ──▶ socket ──▶ dispatch by source
 Navidrome ──plugin───▶ /scrobble ┘                                       ├─ jellyfin → YamTracker
                                                                          └─ navidrome → SQLite
 ```
 
 ## Button value format
 
-`/slack` receives one opaque string per click, namespaced by source so the two
-flows can share an endpoint:
+The listener receives one opaque string per click, namespaced by source so the two
+flows can share one handler:
 
 ```
 jellyfin.<rating>.<media_id>.<media_type>     e.g. jellyfin.5.108545.tv
@@ -46,8 +47,10 @@ cd media_tracker && ../.venv/bin/python listener.py
 ```
 
 `config.ini` holds live credentials and is gitignored — keep it that way.
-Listener binds `127.0.0.1:5190`; put it behind your reverse proxy so Slack can
-reach `/slack`, and point Slack's **Interactivity → Request URL** at it.
+Listener binds `127.0.0.1:5190` for `/watch` and `/scrobble`. Slack clicks do
+not come in over HTTP: in the Slack app settings enable **Socket Mode**, and
+create an app-level token with the `connections:write` scope as `slack_app_token`
+in `config.ini`. Run a single listener process — each one opens its own socket.
 
 The `[navidrome]` section needs `plugin_shared_secret` (any random string; the
 plugin must send the same one) and `db_path` (relative paths resolve against the
