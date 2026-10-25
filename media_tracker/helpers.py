@@ -226,11 +226,15 @@ def query_user(media_id, media_type, media_name):
         ]
     )
 
-def ack_rating():
-    client, dm_channel = slack_dm()
-    content = "Thanks! I've saved your rating."
-    client.chat_postMessage(
-        channel=dm_channel,
+def ack_rating(payload, rating):
+    """Replace the rating prompt with a thank-you, removing its buttons so it
+    cannot be clicked again."""
+    client, _ = slack_dm()
+    question = payload["message"]["text"]
+    content = f"{question}\nYou gave it {rating}/5. Thanks! I've saved your rating."
+    client.chat_update(
+        channel=payload["container"]["channel_id"],
+        ts=payload["container"]["message_ts"],
         text=content,
         blocks=[
             {

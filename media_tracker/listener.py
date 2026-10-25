@@ -14,10 +14,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 
-def _dispatch_action(value):
+def _dispatch_action(value, payload):
     """Route a Slack button click to the right backend.
 
-    Button values are namespaced by source:
+    `payload` is the full interaction payload, used to edit the prompt message
+    in place. Button values are namespaced by source:
         jellyfin.<rating>.<media_id>.<media_type>
         navidrome.<like|dislike>.<event_id>
     """
@@ -30,12 +31,12 @@ def _dispatch_action(value):
     elif source == "jellyfin":
         rating, media_id, media_type = parts[1], parts[2], parts[3]
         helpers.rate_media(media_id, media_type, rating)
-        helpers.ack_rating()
+        helpers.ack_rating(payload, rating)
     elif source.isdigit():
         # Prompts sent before button values were namespaced: <rating>.<id>.<type>.
         rating, media_id, media_type = parts[0], parts[1], parts[2]
         helpers.rate_media(media_id, media_type, rating)
-        helpers.ack_rating()
+        helpers.ack_rating(payload, rating)
     else:
         logger.warning("unroutable button value %r", value)
 
@@ -49,7 +50,7 @@ def _on_socket_request(client: SocketModeClient, req: SocketModeRequest):
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
     for action in req.payload.get('actions', []):
         try:
-            _dispatch_action(action['value'])
+            _dispatch_action(action['value'], req.payload)
         except Exception:
             logger.exception("failed to handle button value %r", action.get('value'))
         break
